@@ -28,8 +28,8 @@
 // Board pinout reference (Waveshare ESP32-S3-Touch-LCD-1.28):
 //   LCD  SPI : SCLK10 MOSI11 MISO12 CS9 DC8 RST14  BL2
 //   I2C shared (touch + IMU): SDA6 SCL7
-//   Touch CST816S : INT5 RST4  addr 0x15
-//   IMU   QMI8658  : INT13     addr 0x6A/0x6B
+//   Touch CST816S : INT5 RST13  addr 0x15
+//   IMU   QMI8658  : INT1 4 / INT2 3   addr 0x6A/0x6B
 //   Battery ADC: GPIO1 (200k/100k divider -> multiply by 3)
 //
 // Drawing goes straight to the panel (no offscreen sprite) so there's
@@ -142,9 +142,17 @@ static const int16_t SWIPE_MIN_DIST = 35;      // px of raw movement to count as
 // ---------- pins ----------
 static const uint8_t PIN_I2C_SDA   = 6;
 static const uint8_t PIN_I2C_SCL   = 7;
-static const uint8_t PIN_TOUCH_RST = 4;
+// Touch reset is GPIO13 and the IMU's INT1 is GPIO4 — these were swapped
+// here until now, meaning every "touch reset" actually toggled the IMU's
+// interrupt line and the touch controller was never reset at all. It went
+// unnoticed because the CST816S comes up fine on its own from a cold power
+// cycle; the cost only shows up when it needs recovering from a bad state,
+// which is exactly when the reset matters. Confirmed against both the
+// Waveshare schematic netlist (TP_RST -> GPIO13) and Waveshare's published
+// pinout.
+static const uint8_t PIN_TOUCH_RST = 13;
 static const uint8_t PIN_TOUCH_INT = 5;
-static const uint8_t PIN_IMU_INT   = 13;
+static const uint8_t PIN_IMU_INT   = 4;
 static const uint8_t PIN_BATT_ADC  = 1;
 
 // ---------- Pip-Boy palette ----------
