@@ -175,6 +175,16 @@ int weatherTempC = 0;
 int weatherHiC = 0;
 int weatherLoC = 0;
 String weatherTxt = "";
+// Declared up here rather than beside the icon drawing code: the Arduino
+// build auto-generates function prototypes at the top of the sketch, so a
+// type used in any signature must exist before them.
+enum WeatherIcon { WI_SUN, WI_PARTLY, WI_CLOUD, WI_RAIN, WI_SNOW, WI_STORM, WI_FOG };
+
+// OpenWeatherMap condition code, carried through by Gadgetbridge (2xx
+// thunderstorm, 3xx drizzle, 5xx rain, 6xx snow, 7xx fog/haze, 800 clear,
+// 801-802 partly cloudy, 803-804 cloudy). 0 = not supplied, in which case
+// the icon falls back to keyword-matching weatherTxt.
+int weatherCode = 0;
 // Wall-clock epoch the current reading arrived at, or 0 if it arrived while
 // the clock was still unset. Persisted with the reading so a reboot can tell
 // how old the restored weather is instead of presenting it as current —
@@ -330,6 +340,7 @@ void handleGadgetbridgeLine(const String &line) {
     weatherHiC = toC(doc["hi"] | rawTemp);
     weatherLoC = toC(doc["lo"] | rawTemp);
     weatherTxt = String((const char *)(doc["txt"] | ""));
+    weatherCode = doc["code"] | 0;
     hasWeather = true;
     forceRedraw = true;
     // Stamp with wall-clock time when it's trustworthy; 0 means "arrived,
@@ -644,6 +655,7 @@ void loadState() {
     weatherHiC = prefs.getInt("wHi", 0);
     weatherLoC = prefs.getInt("wLo", 0);
     weatherTxt = prefs.getString("wTxt", "");
+    weatherCode = prefs.getInt("wCode", 0);
     hasWeather = true;
   }
   prefs.end();
@@ -656,6 +668,7 @@ void saveWeather() {
   prefs.putInt("wHi", weatherHiC);
   prefs.putInt("wLo", weatherLoC);
   prefs.putString("wTxt", weatherTxt);
+  prefs.putInt("wCode", weatherCode);
   prefs.end();
 }
 
@@ -897,7 +910,24 @@ void drawBleBattCluster(int battPct) {
 // pieces, measured and laid out as one centered group.
 
 // Big Font7 temperature with a small degree+C to its right, centered on cx.
-void drawBigTempC(int cx, int cy, int tempC) {
+static const int BIGTEMP_GAP = 8, BIGTEMP_RING_R = 5, BIGTEMP_RING_GAP = 4;
+
+// Width of the whole number+degree+C group. Split out from the drawing so
+// callers can lay the group out beside the weather icon and centre the two
+// together as one unit.
+int bigTempWidth(int tempC) {
+  char numbuf[8];
+  snprintf(numbuf, sizeof(numbuf), "%d", tempC);
+  display.setFont(&fonts::Font7);
+  display.setTextSize(0.85f);
+  int numW = display.textWidth(numbuf);
+  display.setTextSize(1.0f);
+  useSharpMedFont();
+  return numW + BIGTEMP_GAP + BIGTEMP_RING_R * 2 + BIGTEMP_RING_GAP + display.textWidth("C");
+}
+
+// Draws the group with its left edge at x (not centred — see bigTempWidth).
+void drawBigTempAt(int x, int cy, int tempC) {
   char numbuf[8];
   snprintf(numbuf, sizeof(numbuf), "%d", tempC);
 
@@ -906,12 +936,7 @@ void drawBigTempC(int cx, int cy, int tempC) {
   int numW = display.textWidth(numbuf);
   display.setTextSize(1.0f);
 
-  useSharpMedFont();
-  int cW = display.textWidth("C");
-
-  const int GAP = 8, RING_R = 5, RING_GAP = 4;
-  int totalW = numW + GAP + RING_R * 2 + RING_GAP + cW;
-  int x = cx - totalW / 2;
+  const int GAP = BIGTEMP_GAP, RING_R = BIGTEMP_RING_R, RING_GAP = BIGTEMP_RING_GAP;
 
   display.setTextDatum(middle_left);
   display.setTextColor(COL_GREEN, COL_BG);
@@ -932,8 +957,125 @@ void drawBigTempC(int cx, int cy, int tempC) {
   display.setTextDatum(middle_center);
 }
 
+// ---------- weather icons ----------
+// Drawn from primitives rather than stored as bitmaps: they're simple
+// shapes, they scale to whatever box you hand them, and they stay in the
+// single-colour phosphor look without another blob of pixel data in flash.
+// Every shape is expressed as a percentage of `s` so the whole set moves
+// together if the size changes.
+
+// Prefers the OpenWeatherMap condition code (exact, language-independent)
+// and only falls back to sniffing the condition text when the code is
+// missing — provider text is free-form and localised, so it's the less
+// trustworthy of the two.
+WeatherIcon weatherIconFor(int code, const String &txt) {
+  if (code >= 200 && code < 300) return WI_STORM;
+  if (code >= 300 && code < 600) return WI_RAIN;  // drizzle + rain
+  if (code >= 600 && code < 700) return WI_SNOW;
+  if (code >= 700 && code < 800) return WI_FOG;
+  if (code == 800) return WI_SUN;
+  if (code == 801 || code == 802) return WI_PARTLY;
+  if (code == 803 || code == 804) return WI_CLOUD;
+
+  String t = txt;
+  t.toLowerCase();
+  if (t.indexOf("thunder") >= 0 || t.indexOf("storm") >= 0) return WI_STORM;
+  if (t.indexOf("snow") >= 0 || t.indexOf("sleet") >= 0 || t.indexOf("hail") >= 0) return WI_SNOW;
+  if (t.indexOf("rain") >= 0 || t.indexOf("shower") >= 0 || t.indexOf("drizzle") >= 0) return WI_RAIN;
+  if (t.indexOf("fog") >= 0 || t.indexOf("mist") >= 0 || t.indexOf("haze") >= 0) return WI_FOG;
+  if (t.indexOf("partly") >= 0 || t.indexOf("few") >= 0 || t.indexOf("scattered") >= 0) return WI_PARTLY;
+  if (t.indexOf("clear") >= 0 || t.indexOf("sun") >= 0) return WI_SUN;
+  // Anything unrecognised gets the neutral cloud rather than a confident
+  // sun — better to under-claim than to draw a clear sky over a storm.
+  return WI_CLOUD;
+}
+
+// Sun disc plus eight rays, centred in the box (or wherever cx/cy say).
+void drawIconSun(int cx, int cy, int s, uint16_t col) {
+  int r = s * 20 / 100;
+  display.fillCircle(cx, cy, r, col);
+  int inner = r + s * 6 / 100, outer = r + s * 15 / 100;
+  for (int i = 0; i < 8; i++) {
+    float a = i * PI / 4.0f;
+    display.drawWideLine(cx + cosf(a) * inner, cy + sinf(a) * inner,
+                         cx + cosf(a) * outer, cy + sinf(a) * outer, s * 5 / 100, col);
+  }
+}
+
+// Cloud built from three puffs over a flat-bottomed rounded base.
+void drawIconCloud(int x, int y, int s, uint16_t col) {
+  display.fillCircle(x + s * 40 / 100, y + s * 46 / 100, s * 20 / 100, col);
+  display.fillCircle(x + s * 63 / 100, y + s * 55 / 100, s * 16 / 100, col);
+  display.fillCircle(x + s * 22 / 100, y + s * 56 / 100, s * 14 / 100, col);
+  display.fillSmoothRoundRect(x + s * 10 / 100, y + s * 56 / 100,
+                              s * 70 / 100, s * 20 / 100, s * 8 / 100, col);
+}
+
+// Three slanted streaks under a cloud, shared by rain and (shorter) drizzle.
+void drawIconRainStreaks(int x, int y, int s, uint16_t col) {
+  for (int i = 0; i < 3; i++) {
+    int sx = x + s * (24 + i * 20) / 100;
+    display.drawWideLine(sx, y + s * 80 / 100, sx - s * 7 / 100, y + s * 96 / 100, s * 5 / 100, col);
+  }
+}
+
+void drawWeatherIcon(int x, int y, int s, WeatherIcon icon, uint16_t col) {
+  // Wipe the box first: shapes drawn with fills don't erase what a
+  // different icon left behind on an earlier frame.
+  display.fillRect(x, y, s, s, COL_BG);
+
+  switch (icon) {
+    case WI_SUN:
+      drawIconSun(x + s / 2, y + s / 2, s, col);
+      break;
+
+    case WI_PARTLY:
+      // Sun peeking out of the top-left, cloud overlapping its lower right.
+      drawIconSun(x + s * 38 / 100, y + s * 36 / 100, s * 78 / 100, col);
+      display.fillCircle(x + s * 40 / 100, y + s * 46 / 100, s * 20 / 100, COL_BG); // keep the cloud's edge readable against the rays
+      drawIconCloud(x, y + s * 12 / 100, s, col);
+      break;
+
+    case WI_CLOUD:
+      drawIconCloud(x, y + s * 6 / 100, s, col);
+      break;
+
+    case WI_RAIN:
+      drawIconCloud(x, y - s * 6 / 100, s, col);
+      drawIconRainStreaks(x, y - s * 6 / 100, s, col);
+      break;
+
+    case WI_SNOW:
+      drawIconCloud(x, y - s * 6 / 100, s, col);
+      for (int i = 0; i < 3; i++) {
+        display.fillCircle(x + s * (26 + i * 20) / 100, y + s * 82 / 100, s * 5 / 100, col);
+      }
+      break;
+
+    case WI_STORM:
+      drawIconCloud(x, y - s * 8 / 100, s, col);
+      // Lightning bolt: two offset triangles make the classic zigzag.
+      display.fillTriangle(x + s * 52 / 100, y + s * 66 / 100,
+                           x + s * 34 / 100, y + s * 66 / 100,
+                           x + s * 46 / 100, y + s * 90 / 100, col);
+      display.fillTriangle(x + s * 56 / 100, y + s * 62 / 100,
+                           x + s * 40 / 100, y + s * 78 / 100,
+                           x + s * 58 / 100, y + s * 78 / 100, col);
+      break;
+
+    case WI_FOG:
+      drawIconCloud(x, y - s * 12 / 100, s, col);
+      for (int i = 0; i < 3; i++) {
+        int ly = y + s * (68 + i * 12) / 100;
+        int inset = (i % 2) ? s * 22 / 100 : s * 12 / 100;
+        display.fillSmoothRoundRect(x + inset, ly, s - inset * 2, s * 5 / 100, s * 2 / 100, col);
+      }
+      break;
+  }
+}
+
 // Small one-line "23°C  clear sky" row, centered on cx. Same three-piece
-// trick as drawBigTempC(), at the small text size.
+// trick as the big temperature, at the small text size.
 void drawSmallTempRow(int cx, int cy, int tempC, const String &desc, uint16_t col) {
   useSharpSmallFont();
   char numbuf[8];
@@ -1051,7 +1193,14 @@ void drawWeatherScreen(int battPct) {
     display.drawString("feeding Gadgetbridge", 120, 168);
     display.drawString("e.g. Breezy Weather", 120, 188);
   } else {
-    drawBigTempC(120, 100, weatherTempC);
+    // Icon and temperature are laid out as one group and centred together,
+    // so the pair stays balanced whether the reading is "-8" or "100".
+    const int ICON_S = 46, ICON_GAP = 8;
+    int tempW = bigTempWidth(weatherTempC);
+    int groupX = 120 - (ICON_S + ICON_GAP + tempW) / 2;
+    drawWeatherIcon(groupX, 100 - ICON_S / 2, ICON_S,
+                    weatherIconFor(weatherCode, weatherTxt), COL_GREEN);
+    drawBigTempAt(groupX + ICON_S + ICON_GAP, 100, weatherTempC);
 
     // Condition, with an age suffix once the reading is no longer fresh —
     // this data can be restored from flash across a reboot, so it must not
