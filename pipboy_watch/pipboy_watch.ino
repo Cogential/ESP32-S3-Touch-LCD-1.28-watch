@@ -68,7 +68,9 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 static const uint32_t LONG_PRESS_MS = 3000; // hold this long, finger still, to trigger either one
 // POSIX TZ string for America/Toronto — handles EST/EDT DST automatically.
 static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
-static const uint32_t WIFI_RESYNC_INTERVAL_MS = 4UL * 60 * 60 * 1000; // 4h
+// Tracked in seconds of real wall-clock time (not millis()) because millis()
+// resets to 0 on every deep-sleep wake — see rtcLastSyncAttemptEpoch below.
+static const time_t WIFI_RESYNC_INTERVAL_SEC = 4 * 60 * 60; // 4h
 
 // ---------- power saving ----------
 static const uint8_t BRIGHT_ACTIVE = 180;
@@ -148,7 +150,14 @@ float gyroX = 0, gyroY = 0, gyroZ = 0;
 
 uint32_t lastImuPollMs = 0;
 uint32_t lastSaveMs = 0;
-uint32_t lastWifiSyncMs = 0;
+// RTC_DATA_ATTR survives deep sleep (backed by RTC slow memory, unlike
+// regular globals which reset every wake) but not a full power cycle — that
+// initializes it back to 0, which is fine, since a fresh boot always makes
+// its own sync attempt regardless. Tracks the last *attempt*, not last
+// *success*, so a stretch with no WiFi in range retries once per interval
+// rather than either spamming every wake or never retrying again. See
+// wifiResyncDue().
+RTC_DATA_ATTR time_t rtcLastSyncAttemptEpoch = 0;
 uint32_t lastActivityMs = 0;
 bool backlightDimmed = false;
 uint32_t lastDayMarker = 0; // epoch-day steps were last reset on
@@ -326,6 +335,17 @@ void setupBLE() {
 }
 
 // ---------- WiFi / NTP time sync ----------
+// True if it's been over WIFI_RESYNC_INTERVAL_SEC of real wall-clock time
+// since the last resync *attempt* (successful or not — see
+// rtcLastSyncAttemptEpoch), or if the clock isn't valid yet at all. Callers
+// should stamp rtcLastSyncAttemptEpoch = time(nullptr) right before they
+// actually attempt a sync, win or lose, so a stretch with no WiFi in range
+// retries at a steady interval instead of every single wake.
+bool wifiResyncDue() {
+  if (!timeSynced) return true; // no valid clock yet — always worth trying
+  return (time(nullptr) - rtcLastSyncAttemptEpoch) > WIFI_RESYNC_INTERVAL_SEC;
+}
+
 // Shared by every path below once WiFi is already associated. Blocking on
 // purpose — same reasoning as the functions that call it.
 bool fetchNtpTime(uint32_t timeoutMs) {
@@ -914,15 +934,28 @@ void setup() {
     // The RTC domain (and the calendar clock it drives, via time()) stays
     // powered through deep sleep — only regular RAM resets, which is why
     // timeSynced itself comes back false here even though the underlying
-    // clock is still correct. Trust it instead of paying for a full WiFi+
-    // NTP round trip on every single wake; the periodic 4h resync (when the
-    // watch stays awake that long) is still there to correct any drift.
+    // clock is still correct.
     timeSynced = (time(nullptr) > 1700000000);
-    wifiOk = timeSynced;
-    Serial.printf("[pipboy] skipping WiFi on wake, clock looks %s\n", timeSynced ? "valid" : "INVALID");
+
+    // Resync by real elapsed wall-clock time, not the millis()-based timer
+    // loop() uses while continuously awake — millis() resets to 0 on every
+    // wake, so a watch that gets napped often would otherwise never
+    // actually hit a 4h-of-millis() threshold and drift uncorrected
+    // indefinitely. This still skips WiFi entirely on the common case (a
+    // quick glance well within the interval), which is the whole point of
+    // the fast-wake path — it just no longer skips it *forever*.
+    if (wifiResyncDue()) {
+      Serial.println("[pipboy] wake: resync due, trying a quick WiFi reconnect...");
+      rtcLastSyncAttemptEpoch = time(nullptr); // stamp before attempting — throttles retries even on failure
+      bool resynced = syncTimeViaWifi(8000);   // saved creds only, no portal — same as loop()'s periodic resync
+      wifiOk = resynced || timeSynced;         // a failed attempt doesn't invalidate a clock that was already fine
+    } else {
+      wifiOk = timeSynced;
+      Serial.println("[pipboy] wake: recently synced, skipping WiFi.");
+    }
   } else {
     wifiOk = wifiConnectOrSetup();
-    lastWifiSyncMs = millis();
+    rtcLastSyncAttemptEpoch = time(nullptr);
 
     // wifiConnectOrSetup() may have taken over the whole screen for the
     // setup portal — redraw the boot background underneath the final
@@ -1106,8 +1139,11 @@ void loop() {
   }
 
   // Periodic re-sync in case the software clock drifts over a long day.
-  if (now - lastWifiSyncMs > WIFI_RESYNC_INTERVAL_MS) {
-    lastWifiSyncMs = now;
+  // Same wall-clock-based due check the wake-from-sleep path in setup()
+  // uses (see wifiResyncDue()), so the two share one throttle regardless of
+  // how many sleep/wake cycles happen in between.
+  if (wifiResyncDue()) {
+    rtcLastSyncAttemptEpoch = time(nullptr);
     syncTimeViaWifi(10000);
   }
 
