@@ -90,6 +90,12 @@ static const time_t WIFI_RESYNC_INTERVAL_SEC = 4 * 60 * 60; // 4h
 static const uint8_t BRIGHT_ACTIVE = 180;
 static const uint8_t BRIGHT_DIM = 12;
 static const uint32_t IDLE_DIM_TIMEOUT_MS = 8000; // dim backlight after 8s of no touch
+// Deep sleep after this long untouched. Note what this costs: deep sleep drops
+// BLE, so notifications stop arriving until the watch is woken. That is the
+// point of the trade — an idle watch that is genuinely asleep rather than
+// merely dim — but it is a real consequence, not a free one. Setting it to 0
+// disables the automatic sleep and leaves the long-press as the only route in.
+static const uint32_t AUTO_SLEEP_TIMEOUT_MS = 10UL * 60 * 1000;
 // Gyros draw meaningfully more current than accel-only mode on this class of
 // IMU — not worth paying for while nothing reads it. On (costs the extra
 // current) because raise-to-wake, below, is the thing that reads it now.
@@ -948,8 +954,23 @@ void enterDeepSleep() {
   display.startWrite();
   display.fillScreen(COL_BG);
   display.endWrite();
-  display.setBrightness(0);
-  delay(50); // let the backlight PWM actually settle to off before power drops
+
+  // Put the peripherals down before the CPU. Deep sleep only powers down
+  // the ESP32 itself — the panel, touch controller and IMU sit on their own
+  // rails and keep drawing whatever they were drawing, which on a watch-sized
+  // cell is the difference that matters.
+  if (imuOk) {
+    imu.enableAccel(false);
+    imu.enableGyro(false);
+  }
+  // Auto-sleep is what lets the controller idle *and* still pull INT on a
+  // touch — see setAutoSleep() for why this is the opposite of the setting
+  // used while awake. If waking by touch ever stops working, this line is
+  // the first thing to remove.
+  if (touchOk) touch.setAutoSleep(true);
+
+  display.sleep(); // backlight off and the GC9A01 into its own sleep mode
+  delay(50);       // let the backlight PWM settle before power drops
 
   // CST816S holds its INT pin high and pulses it low on a touch event —
   // ext0 wakes the chip the moment that pin goes low. GPIO5 is within the
@@ -2196,6 +2217,17 @@ void loop() {
   if (touchOk && !backlightDimmed && now - lastActivityMs > IDLE_DIM_TIMEOUT_MS) {
     display.setBrightness(BRIGHT_DIM);
     backlightDimmed = true;
+  }
+
+  // Sleep the whole watch after a long stretch untouched. Held off while a
+  // stopwatch or timer is counting: deep sleep is a full reset, so sleeping
+  // through a running timer would silently destroy it and the alarm would
+  // never fire — the one case where "nobody has touched it" plainly does
+  // not mean "nothing is happening".
+  if (touchOk && AUTO_SLEEP_TIMEOUT_MS && !swRunning && !timerRunning &&
+      now - lastActivityMs > AUTO_SLEEP_TIMEOUT_MS) {
+    Serial.println("[pipboy] idle timeout -> deep sleep");
+    enterDeepSleep(); // never returns
   }
 
   // Keep the BLE "steps" characteristic fresh for anyone who reads it.

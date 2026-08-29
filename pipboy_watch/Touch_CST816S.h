@@ -19,14 +19,21 @@ public:
     uint8_t id;
     if (!readReg(0xA7, &id, 1)) return false;
 
-    // Disable auto-sleep (0xFE = DisAutoSleep, 1 = off). Left enabled, the
-    // controller powers down its sensing after a stretch of no touch and
-    // then reports "no finger" to I2C polls until its own interrupt wakes
-    // it — so polling alone silently stops seeing touches, which is
-    // exactly the state the watch sits in once the backlight has dimmed.
-    writeReg(0xFE, 0x01);
+    setAutoSleep(false);
     return true;
   }
+
+  // 0xFE is DisAutoSleep: 1 forbids auto-sleep, 0 permits it.
+  //
+  // Which setting is right depends entirely on how touches are being
+  // detected. While the watch is awake it *polls* over I2C, and an
+  // auto-slept controller answers those polls with "no finger" until its
+  // own interrupt rouses it — so auto-sleep has to be off, or touches go
+  // unnoticed. In ESP32 deep sleep nothing polls: the wake source is the
+  // INT line, which the controller still asserts on touch from its
+  // low-power state. So auto-sleep is exactly wrong awake and exactly
+  // right asleep, and gets toggled at each transition.
+  bool setAutoSleep(bool allow) { return writeReg(0xFE, allow ? 0x00 : 0x01); }
 
   // Returns true if a finger is currently down, and fills x/y (0..239).
   bool read(int16_t &x, int16_t &y) {
