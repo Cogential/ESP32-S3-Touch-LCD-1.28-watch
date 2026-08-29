@@ -2,7 +2,15 @@ default_profile: esp32s3
 
 profiles:
   esp32s3:
-    fqbn: esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB
+    # FlashSize defaults to 4M regardless of PartitionScheme — without this,
+    # the bootloader's own flash-size field stays at 4MB even though the
+    # partition table (and the physical chip — confirmed via `esptool
+    # flash-id`, which reports the real W25Q128 16MB chip correctly) is
+    # sized for 16MB. That mismatch boot-loops the board: "partition 3
+    # invalid ... exceeds flash chip size 0x400000" — the bootloader
+    # rejecting its own partition table against a flash size it was never
+    # told is actually bigger.
+    fqbn: esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M
     platforms:
       - platform: esp32:esp32 (3.3.11)
         platform_index_url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
