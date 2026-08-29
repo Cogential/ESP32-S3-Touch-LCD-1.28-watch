@@ -6,7 +6,10 @@
 // - Step counting from the onboard QMI8658 accelerometer.
 // - Time comes from WiFi + NTP on boot (this board has no RTC chip), then
 //   WiFi is switched off to save power. Re-syncs periodically in case the
-//   software clock drifts.
+//   software clock drifts. No SSID/password is hardcoded: WiFiManager opens
+//   a "PipBoy-Setup" WiFi hotspot + captive portal to pick a network the
+//   first time (or whenever) it can't connect — long-press-and-hold on the
+//   STAT screen reopens it on demand, e.g. to switch onto a phone's hotspot.
 // - BLE peripheral "PIP-BOY 3000": bondable/pairable from Android's
 //   Bluetooth settings, and speaks the open "Bangle.js" Nordic-UART JSON
 //   protocol that Gadgetbridge (free, open-source Android app) already
@@ -25,6 +28,7 @@
 // and "something is on screen" — easier to trust, easier to debug.
 
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <Wire.h>
 #include <QMI8658.h>
 #include <Preferences.h>
@@ -42,9 +46,15 @@
 #include "vaultboy_bitmap.h"
 
 // ---------- WiFi / time ----------
-// WIFI_SSID / WIFI_PASS live in secrets.h (gitignored — see secrets.h.example
-// for the template) so credentials never land in version control.
-#include "secrets.h"
+// No hardcoded SSID/password anymore — WiFiManager owns WiFi credentials
+// (stored in its own NVS blob, separate from Preferences). First boot with
+// nothing saved (or a failed connect) pops a "PipBoy-Setup" WiFi AP + captive
+// portal to pick a network, same flow as most consumer IoT gadgets. A
+// long-press on the STAT screen re-opens that portal on demand, e.g. to
+// switch onto your phone's hotspot. See wifiConnectOrSetup() /
+// forceWifiSetupPortal() below.
+static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
+static const uint32_t WIFI_SETUP_LONG_PRESS_MS = 3000; // hold this long to open the portal
 // POSIX TZ string for America/Toronto — handles EST/EDT DST automatically.
 static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
 static const uint32_t WIFI_RESYNC_INTERVAL_MS = 4UL * 60 * 60 * 1000; // 4h
@@ -101,6 +111,8 @@ uint32_t lastTouchPollMs = 0;
 int16_t touchStartX = 0, touchStartY = 0; // where the current gesture began
 int16_t touchLastX = 0, touchLastY = 0;   // most recent sample of the current gesture
 bool touchWasDimWake = false; // this gesture's first touch woke a dimmed screen — don't also navigate
+uint32_t touchDownStartMs = 0; // when the current gesture's stable "down" began, for long-press timing
+bool longPressConsumed = false; // this gesture already fired its long-press action — skip the swipe check on lift
 bool forceRedraw = true;
 uint32_t notifAutoRevertMs = 0; // when a popped-up notification should hide itself
 bool notifAutoShown = false;
@@ -116,6 +128,11 @@ int weatherTempC = 0;
 int weatherHiC = 0;
 int weatherLoC = 0;
 String weatherTxt = "";
+
+// Latest gyro reading (deg/sec), updated every IMU poll alongside the accel
+// feed into StepCounter. Not consumed by anything yet — available for
+// whatever reads it next.
+float gyroX = 0, gyroY = 0, gyroZ = 0;
 
 uint32_t lastImuPollMs = 0;
 uint32_t lastSaveMs = 0;
@@ -297,12 +314,28 @@ void setupBLE() {
 }
 
 // ---------- WiFi / NTP time sync ----------
-// Blocking on purpose: this only runs at boot and every few hours, and the
-// watch face is already showing a status screen while it happens.
+// Shared by every path below once WiFi is already associated. Blocking on
+// purpose — same reasoning as the functions that call it.
+bool fetchNtpTime(uint32_t timeoutMs) {
+  configTzTime(POSIX_TZ, "pool.ntp.org", "time.google.com");
+  uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    time_t now = time(nullptr);
+    if (now > 1700000000) return true; // sane "this is a real date" sanity check
+    delay(200);
+  }
+  return false;
+}
+
+// Quick reconnect using whatever credentials are already saved to flash
+// (from a prior WiFiManager portal run). No portal, no AP — this is what
+// boot (after the first one) and the periodic 4h resync use, so the watch
+// never surprises you with a setup hotspot mid-day just because it's
+// temporarily out of range of home WiFi.
 bool syncTimeViaWifi(uint32_t timeoutMs) {
-  Serial.println("[pipboy] connecting to WiFi...");
+  Serial.println("[pipboy] connecting to WiFi (saved credentials)...");
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(); // ESP-IDF replays the last SSID/pass it persisted to NVS
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
@@ -317,18 +350,7 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
   }
 
   Serial.println("[pipboy] WiFi connected, fetching NTP time...");
-  configTzTime(POSIX_TZ, "pool.ntp.org", "time.google.com");
-
-  bool gotTime = false;
-  start = millis();
-  while (millis() - start < 8000) {
-    time_t now = time(nullptr);
-    if (now > 1700000000) { // sane "this is a real date" sanity check
-      gotTime = true;
-      break;
-    }
-    delay(200);
-  }
+  bool gotTime = fetchNtpTime(8000);
 
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF); // save power — we don't need WiFi between syncs
@@ -340,6 +362,86 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
   } else {
     Serial.println("[pipboy] NTP sync timed out.");
   }
+  return gotTime;
+}
+
+// Draws the "join the setup hotspot" prompt shown for as long as the
+// captive portal AP is up. WiFiManager's blocking portal loop doesn't give
+// us a redraw callback beyond "AP just started", so this is a one-shot
+// draw, not a live screen — fine, since nothing on it needs to change.
+void drawWifiSetupScreen() {
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.setTextDatum(middle_center);
+  useSharpSmallFont();
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString("WIFI SETUP", 120, 82);
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("join hotspot:", 120, 112);
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString(WIFI_SETUP_AP_NAME, 120, 134);
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("on your phone, then", 120, 160);
+  display.drawString("follow the prompt to", 120, 180);
+  display.drawString("pick your WiFi", 120, 200);
+  display.endWrite();
+}
+
+// First-boot (or nothing valid saved) path: tries saved credentials first —
+// fast, no AP — and only pops the setup hotspot if that fails. Call once,
+// at boot.
+bool wifiConnectOrSetup() {
+  WiFiManager wm;
+  wm.setConnectTimeout(15);       // seconds to try saved creds before giving up
+  wm.setConfigPortalTimeout(180); // don't let the portal hang boot forever if no one responds
+  wm.setAPCallback([](WiFiManager *) { drawWifiSetupScreen(); });
+
+  bool connected = wm.autoConnect(WIFI_SETUP_AP_NAME);
+  if (!connected) {
+    Serial.println("[pipboy] WiFi setup portal timed out with no connection.");
+    forceRedraw = true;
+    return false;
+  }
+
+  Serial.println("[pipboy] WiFi connected, fetching NTP time...");
+  bool gotTime = fetchNtpTime(8000);
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  if (gotTime) {
+    timeSynced = true;
+    Serial.println("[pipboy] NTP sync OK.");
+  } else {
+    Serial.println("[pipboy] NTP sync timed out.");
+  }
+  forceRedraw = true;
+  return gotTime;
+}
+
+// Manually triggered (long-press on the STAT screen) — always reopens the
+// portal, even with credentials already saved, so you can point the watch
+// at a different network (e.g. your phone's hotspot) without first wiping
+// the old one.
+bool forceWifiSetupPortal() {
+  drawWifiSetupScreen();
+
+  WiFiManager wm;
+  wm.setConfigPortalTimeout(180);
+  bool connected = wm.startConfigPortal(WIFI_SETUP_AP_NAME);
+
+  bool gotTime = false;
+  if (connected) {
+    Serial.println("[pipboy] WiFi connected, fetching NTP time...");
+    gotTime = fetchNtpTime(8000);
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    if (gotTime) {
+      timeSynced = true;
+      Serial.println("[pipboy] NTP sync OK.");
+    }
+  } else {
+    Serial.println("[pipboy] WiFi setup portal cancelled/timed out.");
+  }
+  forceRedraw = true;
   return gotTime;
 }
 
@@ -692,6 +794,16 @@ void setup() {
     imu.setAccelRange(QMI8658_ACCEL_RANGE_4G);
     imu.setAccelODR(QMI8658_ACCEL_ODR_250HZ);
     imu.setAccelUnit_mps2(true);
+
+    // Gyro is read but not yet acted on — plumbed in for future gesture/
+    // orientation features (e.g. rejecting wrist-twist from step counts,
+    // raise-to-wake, auto-flip for the other wrist). 512dps covers a sharp
+    // wrist flick with headroom; drop to 256dps if finer resolution is
+    // wanted later and violent motion isn't a concern.
+    imu.enableGyro(true);
+    imu.setGyroRange(QMI8658_GYRO_RANGE_512DPS);
+    imu.setGyroODR(QMI8658_GYRO_ODR_250HZ);
+    imu.setGyroUnit_dps(true);
   }
   drawLoadingBar(45);
 
@@ -700,8 +812,16 @@ void setup() {
   setupBLE();
   drawLoadingBar(60);
 
-  bool wifiOk = syncTimeViaWifi(15000);
+  bool wifiOk = wifiConnectOrSetup();
   lastWifiSyncMs = millis();
+
+  // wifiConnectOrSetup() may have taken over the whole screen for the setup
+  // portal — redraw the boot background underneath the final loading-bar
+  // state so that screen doesn't show through.
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  drawVaultBoy((240 - VAULTBOY_W) / 2, 6, 255);
+  display.endWrite();
   drawLoadingBar(100, wifiOk);
 
   if (!dispOk) {
@@ -734,6 +854,7 @@ void loop() {
     if (imu.readAccelMPS2(ax, ay, az)) {
       stepCounter.update(ax, ay, az);
     }
+    imu.readGyro(gyroX, gyroY, gyroZ); // dps, per setGyroUnit_dps() above
   }
 
   // Day rollover: once we know real wall-clock time, reset the step
@@ -768,6 +889,8 @@ void loop() {
       touchStartX = touchLastX = tx;
       touchStartY = touchLastY = ty;
       touchWasDimWake = backlightDimmed;
+      touchDownStartMs = now;
+      longPressConsumed = false;
       if (backlightDimmed) {
         display.setBrightness(BRIGHT_ACTIVE);
         backlightDimmed = false;
@@ -779,9 +902,30 @@ void loop() {
       touchLastX = tx;
       touchLastY = ty;
       lastActivityMs = now;
+
+      // Long-press-and-hold (finger essentially stationary) opens the WiFi
+      // setup portal — a deliberate, hard-to-trigger-by-accident gesture,
+      // since it's disruptive (takes over the screen, opens a hotspot).
+      if (!touchWasDimWake && !longPressConsumed) {
+        int16_t driftX = touchLastX - touchStartX;
+        int16_t driftY = touchLastY - touchStartY;
+        bool heldStill = abs(driftX) < 15 && abs(driftY) < 15;
+        if (heldStill && now - touchDownStartMs >= WIFI_SETUP_LONG_PRESS_MS) {
+          longPressConsumed = true;
+          forceWifiSetupPortal();
+          // Minutes may have passed inside that blocking call — the touch
+          // chip's idea of "finger down" is stale, so start clean rather
+          // than risk misreading whatever it reports on the next poll.
+          prevTouchDown = false;
+          touchDownStreak = 0;
+          lastActivityMs = millis();
+          return;
+        }
+      }
     } else if (!stableDown && prevTouchDown) {
-      // Finger lifted — decide if this was a swipe.
-      if (!touchWasDimWake) {
+      // Finger lifted — decide if this was a swipe (unless the hold above
+      // already consumed this gesture as a long-press).
+      if (!touchWasDimWake && !longPressConsumed) {
         int16_t rawDx = touchLastX - touchStartX;
         int16_t rawDy = touchLastY - touchStartY;
         int16_t visualSwipe = SWIPE_AXIS_IS_RAW_Y ? rawDy : rawDx;
