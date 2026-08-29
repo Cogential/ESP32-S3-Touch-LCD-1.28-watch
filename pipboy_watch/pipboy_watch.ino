@@ -74,7 +74,8 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 // screen you were on — screen-dependent actions proved unpredictable, since
 // waking from deep sleep reboots and lands back on STAT.
 static const uint32_t TAP_MAX_MS = 600;          // a press shorter than this, held still, counts as a tap
-static const uint32_t STEPS_RESET_ARM_MS = 4000; // window to confirm a step reset with a second tap
+static const uint32_t STEPS_RESET_ARM_MS = 4000; // gap allowed between taps before the count lapses
+static const uint8_t STEPS_RESET_TAPS = 4;       // deliberate taps needed to wipe the day's steps
 static const uint32_t LONG_PRESS_MS = 3000;       // hold at least this long, finger still, then release
 static const uint32_t SLEEP_PRESS_MAX_MS = 6000;  // 3-6s puts it to sleep; beyond that is the portal
 static const uint32_t LONG_PRESS_MAX_MS = 12000;  // ...and past this nothing fires, so something resting on
@@ -160,7 +161,11 @@ static const uint8_t PIN_BATT_ADC  = 1;
 // ---------- Pip-Boy palette ----------
 static const uint16_t COL_BG        = lgfx::color565(0, 0, 0);
 static const uint16_t COL_GREEN     = lgfx::color565(85, 255, 110);   // bright phosphor
-static const uint16_t COL_GREEN_DIM = lgfx::color565(25, 95, 40);     // secondary text
+// Reserved for icon outlines and state (an unconnected Bluetooth rune, the
+// battery shell) and for the boot log's scrollback fade. Text no longer
+// uses it: at this size, on this panel, dim secondary text was markedly
+// harder to read than the clock sitting next to it.
+static const uint16_t COL_GREEN_DIM = lgfx::color565(25, 95, 40);
 static const uint16_t COL_AMBER     = lgfx::color565(255, 170, 60);   // fault/status accent
 static const uint16_t COL_SCANLINE  = lgfx::color565(0, 30, 10);      // faint CRT texture
 
@@ -268,7 +273,8 @@ float gyroX = 0, gyroY = 0, gyroZ = 0;
 uint32_t lastImuPollMs = 0;
 uint32_t lastImuTraceMs = 0;
 uint32_t lastFastDrawMs = 0;
-uint32_t stepsResetArmedMs = 0; // non-zero while a step reset is waiting for its confirming tap
+uint32_t stepsResetArmedMs = 0; // time of the most recent reset tap, 0 when not counting
+uint8_t stepsResetTaps = 0;     // taps counted so far toward STEPS_RESET_TAPS
 uint32_t lastSaveMs = 0;
 // RTC_DATA_ATTR survives deep sleep (backed by RTC slow memory, unlike
 // regular globals which reset every wake) but not a full power cycle — that
@@ -640,11 +646,11 @@ void drawWifiSetupScreen() {
   useSharpSmallFont();
   display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("WIFI SETUP", 120, 82);
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("join hotspot:", 120, 112);
   display.setTextColor(COL_GREEN, COL_BG);
   display.drawString(WIFI_SETUP_AP_NAME, 120, 134);
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("on your phone, then", 120, 160);
   display.drawString("follow the prompt to", 120, 180);
   display.drawString("pick your WiFi", 120, 200);
@@ -892,7 +898,7 @@ void enterDeepSleep() {
   display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("SLEEP", 120, 112);
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("touch to wake", 120, 142);
   display.endWrite();
   delay(900);
@@ -1070,7 +1076,7 @@ void drawBleBattCluster(int battPct) {
   int battX = startX + BT_W + GAP1;
   drawBatteryIcon(battX, rowY - 5, battPct);
   display.setTextDatum(middle_left);
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString(pctbuf, battX + BATT_W + GAP2, rowY);
   display.setTextDatum(middle_center);
 }
@@ -1303,7 +1309,7 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
     // Painted over rather than skipped: redraws don't clear the screen, so
     // a dismissed banner would otherwise stay on the panel until something
     // else forced a full repaint.
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString("                        ", 120, 84);
   }
 
@@ -1356,7 +1362,7 @@ void drawDataScreen(int steps, int battPct) {
   display.setTextDatum(middle_center);
 
   useSharpMedFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("Steps", 120, 80);
 
   char stepbuf[12];
@@ -1370,8 +1376,10 @@ void drawDataScreen(int steps, int battPct) {
   if (stepsResetArmedMs && millis() - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
     useSharpSmallFont();
     display.setTextColor(COL_AMBER, COL_BG);
-    display.drawString(" TAP AGAIN TO RESET ", 120, 168);
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    char prompt[28];
+    snprintf(prompt, sizeof(prompt), " RESET? TAP %u MORE ", STEPS_RESET_TAPS - stepsResetTaps);
+    display.drawString(prompt, 120, 168);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString("                    ", 120, 188);
     drawBleBattCluster(battPct);
     return;
@@ -1381,9 +1389,9 @@ void drawDataScreen(int steps, int battPct) {
   char distbuf[24];
   snprintf(distbuf, sizeof(distbuf), "~%.2f KM", km);
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString(distbuf, 120, 168);
-  display.drawString("   tap to reset   ", 120, 188);
+  display.drawString(" tap 4x to reset  ", 120, 188);
 
   drawBleBattCluster(battPct);
 }
@@ -1398,11 +1406,11 @@ void drawWeatherScreen(int battPct) {
   bool showWeather = hasWeather && !weatherTooStale();
 
   useSharpMedFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("Weather", 120, showWeather ? 56 : 80);
 
   if (!showWeather) {
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString("-- NO DATA --", 120, 120);
     useSharpSmallFont();
     // Gadgetbridge has no weather source of its own — it only relays what
@@ -1443,7 +1451,7 @@ void drawWeatherScreen(int battPct) {
     // won't fit on a single line at this size, and stacking them leaves
     // clearance above the BLE/battery cluster at y=213.
     useSharpMedFont();
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     char hiBuf[16], loBuf[16];
     snprintf(hiBuf, sizeof(hiBuf), "High: %d", weatherHiC);
     snprintf(loBuf, sizeof(loBuf), "Low: %d", weatherLoC);
@@ -1505,7 +1513,7 @@ void timerLoad(uint8_t presetIdx) {
 void drawStopwatchScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("Stopwatch", 120, 66);
 
   uint32_t ms = stopwatchElapsedMs();
@@ -1524,7 +1532,7 @@ void drawStopwatchScreen(int battPct) {
   display.setTextSize(1.0f);
 
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString(swRunning ? " tap to stop " : " tap to start ", 120, 162);
   display.drawString(swRunning || stopwatchElapsedMs() == 0 ? "             " : " swipe to clear ", 120, 182);
 
@@ -1534,7 +1542,7 @@ void drawStopwatchScreen(int battPct) {
 void drawTimerScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   display.drawString("Timer", 120, 66);
 
   uint32_t ms = timerRemainingMs();
@@ -1554,10 +1562,10 @@ void drawTimerScreen(int battPct) {
   if (timerFired) {
     display.setTextColor(COL_AMBER, COL_BG);
     display.drawString("  -- TIME UP --  ", 120, 162);
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString("  tap to reset   ", 120, 182);
   } else {
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString(timerRunning ? "  tap to pause  " : "  tap to start  ", 120, 162);
     display.drawString(timerRunning ? "                " : " swipe: set time ", 120, 182);
   }
@@ -1568,7 +1576,7 @@ void drawTimerScreen(int battPct) {
 void drawNotifScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.setTextColor(COL_GREEN, COL_BG);
   // Header doubles as the position indicator once more than one is held,
   // so it's obvious there are others to scroll to.
   if (notifCount > 1) {
@@ -1580,7 +1588,7 @@ void drawNotifScreen(int battPct) {
   }
 
   if (!notifCount) {
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     display.drawString("-- NONE YET --", 120, 120);
     // The setup hint is only useful before there's a phone connected —
     // once BLE is up, "none yet" just means nothing has arrived, and the
@@ -1602,12 +1610,12 @@ void drawNotifScreen(int battPct) {
     display.setTextColor(COL_GREEN, COL_BG);
     drawWrapped(n.title, 92, 190, 16, 2);
 
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.setTextColor(COL_GREEN, COL_BG);
     drawWrapped(n.body, 134, 190, 16, 4);
 
     // Hint that there's more than one, and which way to move through them.
     if (notifCount > 1) {
-      display.setTextColor(COL_GREEN_DIM, COL_BG);
+      display.setTextColor(COL_GREEN, COL_BG);
       display.drawString(notifIndex > 0 ? "^" : " ", 120, 60);
       display.drawString(notifIndex + 1 < notifCount ? "v" : " ", 120, 198);
     }
@@ -2035,15 +2043,24 @@ void loop() {
           forceRedraw = true;
 
         } else if (tapGesture && currentScreen == SCREEN_DATA) {
-          // Two-step so a stray tap can't wipe a day's step count: the first
-          // arms it and says so, a second within the window confirms.
+          // Four deliberate taps, each within STEPS_RESET_ARM_MS of the last,
+          // before a day's step count is wiped. Nothing else on the watch is
+          // destructive, and the count can't be recovered once gone, so the
+          // gesture is made hard to perform by accident rather than merely
+          // confirmed once.
           if (stepsResetArmedMs && now - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
+            stepsResetTaps++;
+          } else {
+            stepsResetTaps = 1; // stale run — start counting again
+          }
+          stepsResetArmedMs = now;
+
+          if (stepsResetTaps >= STEPS_RESET_TAPS) {
             stepCounter.set(0);
             saveState();
             stepsResetArmedMs = 0;
+            stepsResetTaps = 0;
             Serial.println("[pipboy] steps reset by user.");
-          } else {
-            stepsResetArmedMs = now;
           }
           forceRedraw = true;
 
@@ -2168,6 +2185,7 @@ void loop() {
   // does so the prompt doesn't sit there looking still-armed.
   if (stepsResetArmedMs && now - stepsResetArmedMs >= STEPS_RESET_ARM_MS) {
     stepsResetArmedMs = 0;
+    stepsResetTaps = 0;
     forceRedraw = true;
   }
 
