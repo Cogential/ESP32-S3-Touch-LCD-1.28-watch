@@ -70,7 +70,9 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 // This board has no physical power switch, and the long-press-and-hold
 // gesture is shared by two different actions depending which screen it's
 // done on — see the long-press handling in loop().
-static const uint32_t LONG_PRESS_MS = 3000; // hold this long, finger still, to trigger either one
+static const uint32_t LONG_PRESS_MS = 3000;      // hold at least this long, finger still, then release
+static const uint32_t LONG_PRESS_MAX_MS = 12000; // ...but not longer than this, so something resting on
+                                                 // the screen and later removed doesn't count as a press
 // POSIX TZ string for America/Toronto — handles EST/EDT DST automatically.
 static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
 // Tracked in seconds of real wall-clock time (not millis()) because millis()
@@ -152,12 +154,12 @@ const uint8_t SCREEN_WEATHER = 2;
 const uint8_t SCREEN_NOTIF = 3;
 bool prevTouchDown = false;   // debounced/stable state used for edge detection
 uint8_t touchDownStreak = 0;  // consecutive raw "down" reads in a row
+bool wakeTouchPending = false; // a touch woke the dimmed screen; suppress navigation until it lifts
 uint32_t lastTouchPollMs = 0;
 int16_t touchStartX = 0, touchStartY = 0; // where the current gesture began
 int16_t touchLastX = 0, touchLastY = 0;   // most recent sample of the current gesture
 bool touchWasDimWake = false; // this gesture's first touch woke a dimmed screen — don't also navigate
 uint32_t touchDownStartMs = 0; // when the current gesture's stable "down" began, for long-press timing
-bool longPressConsumed = false; // this gesture already fired its long-press action — skip the swipe check on lift
 bool forceRedraw = true;
 uint32_t notifAutoRevertMs = 0; // when a popped-up notification should hide itself
 bool notifAutoShown = false;
@@ -222,10 +224,15 @@ BLEAdvertising *bleAdvertising = nullptr;
 String nusRxBuffer = "";
 
 class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer *s) override { bleConnected = true; forceRedraw = true; }
+  void onConnect(BLEServer *s) override {
+    bleConnected = true;
+    forceRedraw = true;
+    Serial.println("[pipboy] BLE client connected.");
+  }
   void onDisconnect(BLEServer *s) override {
     bleConnected = false;
     forceRedraw = true;
+    Serial.println("[pipboy] BLE client disconnected, re-advertising.");
     bleAdvertising->start(); // keep advertising so the phone can reconnect
   }
 };
@@ -252,6 +259,10 @@ class TimeWriteCallbacks : public BLECharacteristicCallbacks {
 // Gadgetbridge pushes this automatically on every BLE connect, which is
 // exactly what gets the clock right when away from WiFi.
 void handleGadgetbridgeLine(const String &line) {
+  // Log every line that arrives, so "the phone isn't sending anything" is
+  // distinguishable from "it's sending something we fail to parse".
+  Serial.printf("[pipboy] GB rx: %.120s\n", line.c_str());
+
   int stIdx = line.indexOf("setTime(");
   if (stIdx >= 0) {
     int numStart = stIdx + 8; // strlen("setTime(")
@@ -564,17 +575,40 @@ bool forceWifiSetupPortal() {
 // but a battery percentage doesn't need better than ~30s resolution, and
 // each ADC read has its own small power/time cost. Cached and throttled
 // internally so every call site benefits without needing to know about it.
+// Returns BATT_UNKNOWN when the reading can't plausibly be a LiPo cell —
+// most importantly when no battery is connected at all, where the divider
+// reads whatever the charger leaves on the floating BAT node. Reporting a
+// confident "0%" or "100%" for that is worse than admitting we don't know,
+// so callers render "--" instead.
+//
+// Note this can't distinguish "no battery, USB powered" from "full battery"
+// by voltage alone if the empty node happens to sit near 4.2V; the ETA6098's
+// STAT pin (which would tell us) isn't wired to a GPIO on this board. The
+// raw millivolts are logged on each fresh sample so the thresholds can be
+// checked against what this board actually reads.
+static const int BATT_UNKNOWN = -1;
+static const int BATT_MIN_PLAUSIBLE_MV = 2800; // below a LiPo's protection cutoff
+static const int BATT_MAX_PLAUSIBLE_MV = 4350; // above a full cell plus charge headroom
+
 int readBatteryPercent() {
-  static int cachedPct = -1;
+  static int cachedPct = BATT_UNKNOWN;
   static uint32_t lastReadMs = 0;
+  static bool everRead = false;
   uint32_t now = millis();
-  if (cachedPct < 0 || now - lastReadMs > 30000) {
+  if (!everRead || now - lastReadMs > 30000) {
     int mv = analogReadMilliVolts(PIN_BATT_ADC) * 3; // 200k/100k divider
-    float pct = (mv - 3300) / (4200.0f - 3300.0f) * 100.0f; // rough LiPo curve
-    if (pct < 0) pct = 0;
-    if (pct > 100) pct = 100;
-    cachedPct = (int)(pct + 0.5f);
+    everRead = true;
     lastReadMs = now;
+    if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
+      Serial.printf("[pipboy] battery: %dmV -> no plausible cell, reporting unknown\n", mv);
+      cachedPct = BATT_UNKNOWN;
+    } else {
+      float pct = (mv - 3300) / (4200.0f - 3300.0f) * 100.0f; // rough LiPo curve
+      if (pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      cachedPct = (int)(pct + 0.5f);
+      Serial.printf("[pipboy] battery: %dmV -> %d%%\n", mv, cachedPct);
+    }
   }
   return cachedPct;
 }
@@ -758,6 +792,8 @@ void drawBatteryIcon(int x, int y, int pct) {
   display.fillSmoothRoundRect(x + BORDER, y + BORDER, BW - 2 * BORDER, BH - 2 * BORDER, RAD - BORDER, COL_BG);
   display.fillRect(x + BW, y + (BH - NUBH) / 2, NUBW, NUBH, COL_GREEN_DIM);
 
+  if (pct == BATT_UNKNOWN) return; // empty shell — no cell to represent
+
   int innerW = BW - 2 * BORDER - 2 * INSET;
   int fw = innerW * pct / 100;
   if (fw < 0) fw = 0;
@@ -776,7 +812,11 @@ void drawBleBattCluster(int battPct) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
   char pctbuf[8];
-  snprintf(pctbuf, sizeof(pctbuf), "%d%%", battPct);
+  if (battPct == BATT_UNKNOWN) {
+    snprintf(pctbuf, sizeof(pctbuf), "--");
+  } else {
+    snprintf(pctbuf, sizeof(pctbuf), "%d%%", battPct);
+  }
   int pctW = display.textWidth(pctbuf);
   const int BT_W = 8, GAP1 = 10, BATT_W = 22, GAP2 = 5;
   int totalW = BT_W + GAP1 + BATT_W + GAP2 + pctW;
@@ -1324,13 +1364,30 @@ void loop() {
     touchDownStreak = rawDown ? min((int)touchDownStreak + 1, 5) : 0;
     bool stableDown = touchDownStreak >= 3;
 
+    // Waking the screen deliberately bypasses the 3-poll debounce that
+    // gates *navigation*. That debounce exists so a noisy read can't
+    // trigger a screen change, but the cost of a spurious wake is only a
+    // brief backlight blip — whereas requiring ~90ms of sustained contact
+    // makes a quick tap feel like it did nothing. (Deliberately not using
+    // the INT pin as a second signal here: if it ever idles low, this
+    // would re-wake every poll and the screen would never dim again —
+    // a worse failure than a slightly less sensitive wake.)
+    if (backlightDimmed && rawDown) {
+      wakeScreen(now);
+      // The finger that woke the screen must not also navigate. This has
+      // to outlive wakeScreen() clearing backlightDimmed, since the
+      // gesture-start branch below derives touchWasDimWake from that flag
+      // — so it's tracked separately and held until the finger lifts.
+      wakeTouchPending = true;
+    }
+    if (!rawDown && touchDownStreak == 0) wakeTouchPending = false;
+
     if (stableDown && !prevTouchDown) {
       // Gesture just started.
       touchStartX = touchLastX = tx;
       touchStartY = touchLastY = ty;
-      touchWasDimWake = backlightDimmed;
+      touchWasDimWake = backlightDimmed || wakeTouchPending;
       touchDownStartMs = now;
-      longPressConsumed = false;
       if (backlightDimmed) {
         wakeScreen(now);
       }
@@ -1341,45 +1398,49 @@ void loop() {
       touchLastY = ty;
       lastActivityMs = now;
 
-      // Long-press-and-hold (finger essentially stationary) does one of two
-      // screen-dependent things — both deliberately disruptive/hard to
-      // trigger by accident, so they're gated behind a hold, not a tap:
-      //   STAT (0) -> reopen the WiFi setup portal
-      //   DATA (1) -> deep sleep (this board's only "power button")
-      // Every other screen: long-press does nothing.
-      if (!touchWasDimWake && !longPressConsumed && (currentScreen == 0 || currentScreen == 1)) {
-        int16_t driftX = touchLastX - touchStartX;
-        int16_t driftY = touchLastY - touchStartY;
-        bool heldStill = abs(driftX) < 15 && abs(driftY) < 15;
-        if (heldStill && now - touchDownStartMs >= LONG_PRESS_MS) {
-          longPressConsumed = true;
-          if (currentScreen == 1) {
-            enterDeepSleep(); // never returns — next code that runs is setup()
-          }
-          forceWifiSetupPortal();
-          // Minutes may have passed inside that blocking call — the touch
-          // chip's idea of "finger down" is stale, so start clean rather
-          // than risk misreading whatever it reports on the next poll.
-          prevTouchDown = false;
-          touchDownStreak = 0;
-          lastActivityMs = millis();
-          return;
-        }
-      }
     } else if (!stableDown && prevTouchDown) {
-      // Finger lifted — decide if this was a swipe (unless the hold above
-      // already consumed this gesture as a long-press).
-      if (!touchWasDimWake && !longPressConsumed) {
+      // Finger lifted — this is where every gesture is resolved.
+      if (!touchWasDimWake) {
         int16_t rawDx = touchLastX - touchStartX;
         int16_t rawDy = touchLastY - touchStartY;
         int16_t visualSwipe = SWIPE_AXIS_IS_RAW_Y ? rawDy : rawDx;
         if (SWIPE_INVERT) visualSwipe = -visualSwipe;
+        uint32_t heldMs = now - touchDownStartMs;
+        bool heldStill = abs(rawDx) < 15 && abs(rawDy) < 15;
 
         if (abs(visualSwipe) >= SWIPE_MIN_DIST) {
           if (visualSwipe > 0) currentScreen = (currentScreen + 1) % NUM_SCREENS;
           else currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
           notifAutoShown = false; // user's driving now, stop the auto-revert timer
           forceRedraw = true;
+
+        } else if (heldStill && heldMs >= LONG_PRESS_MS && heldMs <= LONG_PRESS_MAX_MS) {
+          // Long-press actions fire on *release*, not while still held, and
+          // only for a hold inside a sane duration window. Firing mid-hold
+          // meant anything resting against the screen — the watch set face
+          // down, a sleeve, a cable pressing on it — sailed past the 3s
+          // threshold and silently opened the WiFi portal (observed doing
+          // exactly that in a serial log, which also knocks Gadgetbridge
+          // offline for as long as the portal is up). A resting object
+          // never lifts, so release-triggering can't be fooled by one; the
+          // upper bound covers the case where it's eventually removed.
+          //   STAT (0) -> reopen the WiFi setup portal
+          //   DATA (1) -> deep sleep (this board's only "power button")
+          // Every other screen: long-press does nothing.
+          Serial.printf("[pipboy] long-press released after %lums on screen %u\n",
+                        (unsigned long)heldMs, currentScreen);
+          if (currentScreen == 1) {
+            enterDeepSleep(); // never returns — next code that runs is setup()
+          } else if (currentScreen == 0) {
+            forceWifiSetupPortal();
+            // Minutes may have passed inside that blocking call — the touch
+            // chip's idea of "finger down" is stale, so start clean rather
+            // than risk misreading whatever it reports on the next poll.
+            prevTouchDown = false;
+            touchDownStreak = 0;
+            lastActivityMs = millis();
+            return;
+          }
         }
       }
     }

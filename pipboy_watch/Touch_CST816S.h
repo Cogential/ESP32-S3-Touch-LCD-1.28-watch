@@ -17,7 +17,15 @@ public:
     if (intPin != 0xFF) pinMode(intPin, INPUT);
     // Probe: reading the chip-id register should succeed if the device is present.
     uint8_t id;
-    return readReg(0xA7, &id, 1);
+    if (!readReg(0xA7, &id, 1)) return false;
+
+    // Disable auto-sleep (0xFE = DisAutoSleep, 1 = off). Left enabled, the
+    // controller powers down its sensing after a stretch of no touch and
+    // then reports "no finger" to I2C polls until its own interrupt wakes
+    // it — so polling alone silently stops seeing touches, which is
+    // exactly the state the watch sits in once the backlight has dimmed.
+    writeReg(0xFE, 0x01);
+    return true;
   }
 
   // Returns true if a finger is currently down, and fills x/y (0..239).
@@ -34,6 +42,13 @@ public:
 private:
   TwoWire *_wire = nullptr;
   uint8_t _addr = 0x15;
+
+  bool writeReg(uint8_t reg, uint8_t val) {
+    _wire->beginTransmission(_addr);
+    _wire->write(reg);
+    _wire->write(val);
+    return _wire->endTransmission() == 0;
+  }
 
   bool readReg(uint8_t reg, uint8_t *out, uint8_t len) {
     _wire->beginTransmission(_addr);
