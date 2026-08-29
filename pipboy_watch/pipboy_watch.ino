@@ -954,6 +954,24 @@ void enterDeepSleep() {
   // CST816S holds its INT pin high and pulses it low on a touch event —
   // ext0 wakes the chip the moment that pin goes low. GPIO5 is within the
   // S3's low-power IO domain, which ext0 requires.
+  //
+  // TODO (hardware pending): physical power button.
+  //   The rear header brings out GPIO15/16/17/18/21/33 plus GND and 3V3,
+  //   none of which this firmware uses. A momentary button between GND and
+  //   one of GPIO15/16/17/18/21 is all the hardware needed — the internal
+  //   pull-up idles the pin high and a press pulls it low. Not GPIO33: only
+  //   GPIO0-21 are RTC-capable on the S3, and a non-RTC pin cannot wake the
+  //   chip from deep sleep at all.
+  //
+  //   Two firmware changes go with it:
+  //     1. ext0 handles exactly one pin, so waking on touch *and* a button
+  //        means moving to esp_sleep_enable_ext1_wakeup() with both pins in
+  //        the mask and ESP_EXT1_WAKEUP_ANY_LOW. Both idle high, so that
+  //        mode suits them without further conditioning.
+  //     2. Internal pull-ups are switched off entering deep sleep, so the
+  //        button pin needs rtc_gpio_pullup_en() or it floats — and a
+  //        floating input will wake the watch at random, which reads as
+  //        "the battery drains overnight" rather than as a wiring fault.
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOUCH_INT, 0);
   esp_deep_sleep_start();
   // Never reaches here — the reset vector (setup()) is the only way out.
