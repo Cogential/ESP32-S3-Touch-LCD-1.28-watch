@@ -92,28 +92,37 @@ static const uint32_t IDLE_DIM_TIMEOUT_MS = 8000; // dim backlight after 8s of n
 // current) because raise-to-wake, below, is the thing that reads it now.
 static const bool GYRO_ENABLED = true;
 // Periodic accel/gyro logging, used to calibrate raise-to-wake against the
-// board's real axis convention rather than an assumed one. Set false once
-// the thresholds below are settled.
-static const bool IMU_TRACE = true;
+// board's real axis convention rather than an assumed one. Off now that the
+// thresholds below are calibrated; flip on to re-measure.
+static const bool IMU_TRACE = false;
 
 // ---------- raise-to-wake (gyro) ----------
-// Calibrated against the real board (see IMU_TRACE): resting face-up it
-// reads a = (-1.6, 9.8, 1.9) m/s^2, i.e. gravity lands on +Y, so +Y is the
-// axis pointing out of the screen. The first version of this guessed +Z and
-// consequently never fired — the dot product below sat near zero no matter
-// how the watch was moved.
+// Calibrated from logged wrist raises on the real board, not from
+// assumptions — two earlier attempts got this wrong. The first guessed the
+// screen normal was +Z and never fired at all. The second read a resting
+// sample of (-1.6, 9.8, 1.9) and concluded +Y, but the board was propped on
+// edge for that, not face up. Resting genuinely face up it reads
+// a = (-1.1, 2.5, -9.5) m/s^2, so the screen normal is -Z.
 static const float RAISE_GYRO_THRESHOLD_DPS = 80.0f; // rotation speed that counts as an active wrist turn, not ambient jitter
 static const uint32_t RAISE_GYRO_MIN_MS = 50;        // must sustain that rotation this long — filters brief knocks
 static const uint32_t RAISE_GYRO_MAX_MS = 1500;      // ...but a raise is a flick, not a slow drift — cap it too
-// Gravity vector (m/s^2) expected once the watch settles with the screen
-// toward you. Measured convention above: screen normal is +Y.
+// Gravity vector (m/s^2) in the viewing position, taken from samples logged
+// while the watch was actually being held up and looked at:
+// a ~ (0, -7.2, -5.5), scaled to magnitude ~9.8 to match the normalisation
+// in updateRaiseToWake().
+//
+// Note the sign on Y. An earlier pass targeted (0, +4.9, -8.5) and got this
+// exactly backwards — that is the orientation the watch rests in on a desk,
+// so it woke on being *put down* and stayed dark while raised. The two are
+// only distinguishable given the report of which motion produced the wake;
+// the log alone cannot say which samples were which.
 static const float RAISE_ACCEL_TARGET_X = 0.0f;
-static const float RAISE_ACCEL_TARGET_Y = 9.8f;
-static const float RAISE_ACCEL_TARGET_Z = 0.0f;
-// Cosine similarity to that target; 1.0 = screen exactly level and facing
-// straight up. A wrist held at a natural viewing angle is tilted well off
-// level, so this has to be forgiving — 0.5 accepts anything within ~60°.
-static const float RAISE_ACCEL_DOT_MIN = 0.5f;
+static const float RAISE_ACCEL_TARGET_Y = -7.8f;
+static const float RAISE_ACCEL_TARGET_Z = -6.0f;
+// Cosine similarity to that target. Measured: raised-and-viewed samples
+// score ~0.99-1.00 against it, while resting-on-a-desk samples score
+// 0.00-0.38. 0.80 sits well clear of both.
+static const float RAISE_ACCEL_DOT_MIN = 0.80f;
 static const uint32_t RAISE_COOLDOWN_MS = 1500; // minimum gap between two raise-to-wake triggers
 
 // ---------- swipe navigation ----------
