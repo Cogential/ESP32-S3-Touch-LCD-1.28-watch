@@ -470,12 +470,26 @@ void drawWifiSetupScreen() {
 // fast, no AP — and only pops the setup hotspot if that fails. Call once,
 // at boot.
 bool wifiConnectOrSetup() {
+  // BLE and WiFi share one 2.4GHz radio on the S3 — advertising still
+  // running while the setup portal's AP/DNS/web server are also active
+  // means the two contend for airtime, which was making the portal itself
+  // (network scan, saving credentials) slow or unresponsive enough to lose
+  // the race against a phone's own "this network has no internet, give up"
+  // timeout (~30s on Android). Paused for the duration, resumed after.
+  if (bleAdvertising) bleAdvertising->stop();
+
   WiFiManager wm;
   wm.setConnectTimeout(15);       // seconds to try saved creds before giving up
   wm.setConfigPortalTimeout(180); // don't let the portal hang boot forever if no one responds
+  // Respond to the phone the instant credentials are saved, instead of
+  // first spending several more seconds actually testing that the new
+  // connection works — that verification step was exactly the kind of
+  // delay a phone's own patience runs out on first.
+  wm.setBreakAfterConfig(true);
   wm.setAPCallback([](WiFiManager *) { drawWifiSetupScreen(); });
 
   bool connected = wm.autoConnect(WIFI_SETUP_AP_NAME);
+  if (bleAdvertising) bleAdvertising->start();
   if (!connected) {
     Serial.println("[pipboy] WiFi setup portal timed out with no connection.");
     forceRedraw = true;
@@ -503,9 +517,14 @@ bool wifiConnectOrSetup() {
 bool forceWifiSetupPortal() {
   drawWifiSetupScreen();
 
+  // Same reasoning as wifiConnectOrSetup() — see its comment.
+  if (bleAdvertising) bleAdvertising->stop();
+
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);
+  wm.setBreakAfterConfig(true);
   bool connected = wm.startConfigPortal(WIFI_SETUP_AP_NAME);
+  if (bleAdvertising) bleAdvertising->start();
 
   bool gotTime = false;
   if (connected) {
