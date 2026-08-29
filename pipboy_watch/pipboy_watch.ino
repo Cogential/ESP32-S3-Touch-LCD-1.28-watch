@@ -343,6 +343,16 @@ void handleGadgetbridgeLine(const String &line) {
     notifAutoRevertMs = millis() + 8000;
     wakeScreen(millis());
 
+  } else if (strcmp(type, "notify-") == 0) {
+    // Phone-side dismissal. Without handling this, hasNotif would latch on
+    // forever after the first notification and the STAT banner could never
+    // return to blank. Ids aren't tracked — the watch only ever holds one
+    // notification — so any dismissal clears the one being shown.
+    notifSrc = notifTitle = notifBody = "";
+    hasNotif = false;
+    forceRedraw = true;
+    Serial.println("[pipboy] notification dismissed on phone.");
+
   } else if (strcmp(type, "weather") == 0) {
     // Gadgetbridge's Bangle.js weather payload is
     //   {t:"weather", temp, hi, lo, hum, rain, uv, code, txt, wind, wdir, loc}
@@ -873,6 +883,19 @@ void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now)
 void useSharpSmallFont() { display.setFont(&fonts::FreeMonoBold9pt7b); display.setTextSize(0.75f); }
 void useSharpMedFont()   { display.setFont(&fonts::FreeMonoBold12pt7b); display.setTextSize(1.0f); }
 
+// Trims a string until it fits maxW pixels in the *currently set* font,
+// marking the cut with "..." — the FreeMono faces have no ellipsis glyph.
+// Used for notification text, where an app name plus a sender can easily
+// outrun the usable width of a round 240px panel.
+String fitToWidth(const String &s, int maxW) {
+  if (display.textWidth(s) <= maxW) return s;
+  String out = s;
+  while (out.length() > 1 && display.textWidth(out + "...") > maxW) {
+    out.remove(out.length() - 1);
+  }
+  return out + "...";
+}
+
 // Bluetooth rune, traced from the real logo (spine + one zigzag flag) and
 // drawn with anti-aliased lines instead of the old plain on/off dot.
 void drawBluetoothIcon(int cx, int cy, bool connected) {
@@ -1149,6 +1172,24 @@ void drawSmallTempRow(int cx, int cy, int tempC, const String &desc, uint16_t co
 
 void drawStatScreen(struct tm &t, int steps, int battPct) {
   display.setTextDatum(middle_center);
+
+  // Notification banner above the time — "Signal - Dakota Carrie" style,
+  // app name and sender, no message body (that's what the NOTIF screen is
+  // for). Blank when nothing is pending, so the clock face stays clean.
+  useSharpSmallFont();
+  if (hasNotif) {
+    String banner = notifSrc;
+    if (notifTitle.length()) banner += banner.length() ? " - " + notifTitle : notifTitle;
+    if (!banner.length()) banner = "NOTIFICATION"; // neither field supplied
+    display.setTextColor(COL_GREEN, COL_BG);
+    display.drawString(fitToWidth(banner, 205), 120, 84);
+  } else {
+    // Painted over rather than skipped: redraws don't clear the screen, so
+    // a dismissed banner would otherwise stay on the panel until something
+    // else forced a full repaint.
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString("                        ", 120, 84);
+  }
 
   // Time — centered in the middle of the screen, everything else stacks
   // below it.
