@@ -3,8 +3,10 @@
 // - Round GC9A01 display, green-phosphor CRT look, four screens (tap to
 //   cycle): STAT (clock + weather one-liner), DATA (steps), WEATHER (full
 //   temp/hi-lo/condition), NOTIF (latest phone notification).
-// - Step counting from the onboard QMI8658 accelerometer; the gyro is read
-//   too (gyroX/Y/Z) but not yet consumed by anything.
+// - Step counting from the onboard QMI8658 accelerometer. The IMU's gyro
+//   is left disabled (see GYRO_ENABLED) — nothing consumes it yet, and a
+//   running-but-unused gyro is pure current draw for no benefit. Flip that
+//   one flag when a gesture/orientation feature actually needs it.
 // - No physical power switch on this board — long-press-and-hold (3s,
 //   finger still) on the DATA screen puts it into a real ESP32 deep sleep
 //   instead, waking back up on the next touch. See enterDeepSleep() and the
@@ -45,6 +47,7 @@
 #include <ArduinoJson.h>
 #include <time.h>
 #include <esp_sleep.h>
+#include <esp_pm.h>
 
 #include "LGFX_Config.hpp"
 #include "Touch_CST816S.h"
@@ -76,6 +79,11 @@ static const time_t WIFI_RESYNC_INTERVAL_SEC = 4 * 60 * 60; // 4h
 static const uint8_t BRIGHT_ACTIVE = 180;
 static const uint8_t BRIGHT_DIM = 12;
 static const uint32_t IDLE_DIM_TIMEOUT_MS = 8000; // dim backlight after 8s of no touch
+// Gyros draw meaningfully more current than accel-only mode on this class of
+// IMU — not worth paying for while gyroX/Y/Z has no consumer. Flip to true
+// (and un-comment the two blocks it gates, in setup() and loop()) the day a
+// gesture/orientation feature actually reads it.
+static const bool GYRO_ENABLED = false;
 
 // ---------- swipe navigation ----------
 // The display is rotated 90° in software (see setRotation(1) in setup()),
@@ -539,6 +547,37 @@ void saveState() {
 }
 
 // ---------- power ----------
+// Lets the CPU automatically drop clock speed (down to min_freq_mhz) and
+// grab brief automatic light-sleep windows during any idle time in loop()
+// (e.g. every delay(), every blocking wait) — completely transparent to
+// application timing, so nothing about polling rates, redraw cadence, or
+// reconnect behavior changes even when it's working.
+//
+// IMPORTANT: this requires the esp32 Arduino core itself to have been
+// *built* with CONFIG_PM_ENABLE (FreeRTOS tickless idle) turned on. As of
+// core 3.3.11, the official prebuilt board package does NOT have that set
+// (confirmed via its sdkconfig) — esp_pm_configure() still links and runs,
+// but is compiled down to a no-op that returns ESP_ERR_NOT_SUPPORTED,
+// nothing more. Called anyway, and logged honestly either way, rather than
+// assumed: if a future core release (or a custom-built one via
+// esp32-arduino-lib-builder) ships with it on, this starts working with no
+// code changes needed here — but don't take "no crash" as "it's working"
+// without checking this exact log line on real hardware.
+void setupPowerManagement() {
+  esp_pm_config_t pmConfig = {
+    .max_freq_mhz = 80,  // matches the fixed setCpuFrequencyMhz(80) ceiling above
+    .min_freq_mhz = 40,  // drop here when idle; still responsive enough for I2C/SPI/BLE
+    .light_sleep_enable = true,
+  };
+  esp_err_t err = esp_pm_configure(&pmConfig);
+  if (err == ESP_OK) {
+    Serial.println("[pipboy] automatic light sleep ENABLED.");
+  } else {
+    Serial.printf("[pipboy] esp_pm_configure() -> %s — not active (core likely lacks CONFIG_PM_ENABLE)\n",
+                   esp_err_to_name(err));
+  }
+}
+
 // This board has no physical power switch, so this is the closest
 // equivalent: a real ESP32 deep sleep (CPU, display, radios all powered
 // down — this is what actually saves battery, unlike the backlight-only
@@ -895,7 +934,11 @@ void setup() {
   // This app is nowhere near CPU-bound (a clock face + light I2C polling),
   // so run at the lowest clock WiFi still tolerates reliably instead of
   // the default 240MHz — meaningfully less power for identical behavior.
+  // This is the floor either way; setupPowerManagement() below tries to do
+  // even better (dynamic scaling + light sleep) on top of it, when the core
+  // build actually supports it.
   setCpuFrequencyMhz(80);
+  setupPowerManagement();
 
   Serial.println("[pipboy] display.init()...");
   bool dispOk = display.init();
@@ -949,15 +992,17 @@ void setup() {
     imu.setAccelODR(QMI8658_ACCEL_ODR_250HZ);
     imu.setAccelUnit_mps2(true);
 
-    // Gyro is read but not yet acted on — plumbed in for future gesture/
-    // orientation features (e.g. rejecting wrist-twist from step counts,
-    // raise-to-wake, auto-flip for the other wrist). 512dps covers a sharp
-    // wrist flick with headroom; drop to 256dps if finer resolution is
-    // wanted later and violent motion isn't a concern.
-    imu.enableGyro(true);
-    imu.setGyroRange(QMI8658_GYRO_RANGE_512DPS);
-    imu.setGyroODR(QMI8658_GYRO_ODR_250HZ);
-    imu.setGyroUnit_dps(true);
+    // Off by default (see GYRO_ENABLED) — nothing reads gyroX/Y/Z yet, and
+    // a running gyro costs real current for zero current benefit. 512dps
+    // covers a sharp wrist flick with headroom, for whenever a gesture/
+    // orientation feature (rejecting wrist-twist from step counts,
+    // raise-to-wake, auto-flip for the other wrist) actually wants it.
+    if (GYRO_ENABLED) {
+      imu.enableGyro(true);
+      imu.setGyroRange(QMI8658_GYRO_RANGE_512DPS);
+      imu.setGyroODR(QMI8658_GYRO_ODR_250HZ);
+      imu.setGyroUnit_dps(true);
+    }
   }
   drawLoadingBar(45);
 
@@ -1036,7 +1081,7 @@ void loop() {
     if (imu.readAccelMPS2(ax, ay, az)) {
       stepCounter.update(ax, ay, az);
     }
-    imu.readGyro(gyroX, gyroY, gyroZ); // dps, per setGyroUnit_dps() above
+    if (GYRO_ENABLED) imu.readGyro(gyroX, gyroY, gyroZ); // dps, per setGyroUnit_dps() above
   }
 
   // Day rollover: once we know real wall-clock time, reset the step
