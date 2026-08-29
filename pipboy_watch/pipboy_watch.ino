@@ -175,6 +175,16 @@ int weatherTempC = 0;
 int weatherHiC = 0;
 int weatherLoC = 0;
 String weatherTxt = "";
+// Wall-clock epoch the current reading arrived at, or 0 if it arrived while
+// the clock was still unset. Persisted with the reading so a reboot can tell
+// how old the restored weather is instead of presenting it as current —
+// Gadgetbridge only pushes on its own schedule, so without this the watch
+// shows "NO DATA" after every boot until the phone next feels like sending.
+time_t weatherEpoch = 0;
+// Past this, a restored reading is too old to be worth showing at all.
+static const time_t WEATHER_MAX_AGE_SEC = 12 * 60 * 60;
+// Below this, it's current enough not to bother captioning with an age.
+static const time_t WEATHER_FRESH_SEC = 15 * 60;
 
 // Latest gyro reading (deg/sec), updated every IMU poll alongside the accel
 // feed into StepCounter. Not consumed by anything yet — available for
@@ -322,6 +332,12 @@ void handleGadgetbridgeLine(const String &line) {
     weatherTxt = String((const char *)(doc["txt"] | ""));
     hasWeather = true;
     forceRedraw = true;
+    // Stamp with wall-clock time when it's trustworthy; 0 means "arrived,
+    // but we can't date it", which the age display treats as unknown
+    // rather than as brand new.
+    time_t nowEpoch = time(nullptr);
+    weatherEpoch = (nowEpoch > 1700000000) ? nowEpoch : 0;
+    saveWeather();
     Serial.printf("[pipboy] weather: %dC (%s)\n", weatherTempC, weatherTxt.c_str());
   }
   // Other message types (notify-, music, findPhone, etc.) are ignored for now.
@@ -618,7 +634,45 @@ void loadState() {
   prefs.begin("pipboy", false);
   stepCounter.begin(prefs.getUInt("steps", 0));
   lastDayMarker = prefs.getUInt("dayMarker", 0);
+
+  // Restore the last weather so a reboot isn't stuck on "NO DATA" until the
+  // phone next pushes. Age is judged at draw time, not here: this runs
+  // before NTP/BLE time sync, so the clock usually isn't trustworthy yet.
+  weatherEpoch = (time_t)prefs.getULong("wEpoch", 0);
+  if (weatherEpoch > 0) {
+    weatherTempC = prefs.getInt("wTemp", 0);
+    weatherHiC = prefs.getInt("wHi", 0);
+    weatherLoC = prefs.getInt("wLo", 0);
+    weatherTxt = prefs.getString("wTxt", "");
+    hasWeather = true;
+  }
   prefs.end();
+}
+
+void saveWeather() {
+  prefs.begin("pipboy", false);
+  prefs.putULong("wEpoch", (uint32_t)weatherEpoch);
+  prefs.putInt("wTemp", weatherTempC);
+  prefs.putInt("wHi", weatherHiC);
+  prefs.putInt("wLo", weatherLoC);
+  prefs.putString("wTxt", weatherTxt);
+  prefs.end();
+}
+
+// Seconds since the current reading arrived, or -1 when that can't be known
+// (no reading, or it arrived before the clock was set).
+long weatherAgeSec() {
+  if (!hasWeather || weatherEpoch == 0) return -1;
+  time_t now = time(nullptr);
+  if (now < 1700000000) return -1; // clock not trustworthy yet
+  long age = (long)(now - weatherEpoch);
+  return age < 0 ? -1 : age; // negative means the clock moved backwards; treat as unknown
+}
+
+// True when a restored reading is old enough that showing it would mislead.
+bool weatherTooStale() {
+  long age = weatherAgeSec();
+  return age >= 0 && age > WEATHER_MAX_AGE_SEC;
 }
 
 void saveState() {
@@ -938,7 +992,7 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
 
   // Current temperature + condition only — the high/low pair lives on the
   // dedicated WEATHER screen, where there's room to label it properly.
-  if (hasWeather) {
+  if (hasWeather && !weatherTooStale()) {
     drawSmallTempRow(120, 192, weatherTempC, weatherTxt, COL_GREEN_DIM);
   } else {
     // Blank the row so a stale reading can't linger between redraws.
@@ -978,11 +1032,13 @@ void drawDataScreen(int steps, int battPct) {
 void drawWeatherScreen(int battPct) {
   display.setTextDatum(middle_center);
 
+  bool showWeather = hasWeather && !weatherTooStale();
+
   useSharpMedFont();
   display.setTextColor(COL_GREEN_DIM, COL_BG);
-  display.drawString("Weather", 120, hasWeather ? 56 : 80);
+  display.drawString("Weather", 120, showWeather ? 56 : 80);
 
-  if (!hasWeather) {
+  if (!showWeather) {
     display.setTextColor(COL_GREEN_DIM, COL_BG);
     display.drawString("-- NO DATA --", 120, 120);
     useSharpSmallFont();
@@ -997,11 +1053,21 @@ void drawWeatherScreen(int battPct) {
   } else {
     drawBigTempC(120, 100, weatherTempC);
 
-    if (weatherTxt.length()) {
-      useSharpSmallFont();
-      display.setTextColor(COL_GREEN, COL_BG);
-      display.drawString(weatherTxt, 120, 138);
+    // Condition, with an age suffix once the reading is no longer fresh —
+    // this data can be restored from flash across a reboot, so it must not
+    // present itself as current when it isn't. Padded on both sides so a
+    // longer caption from the previous frame can't leave fragments behind.
+    useSharpSmallFont();
+    display.setTextColor(COL_GREEN, COL_BG);
+    long age = weatherAgeSec();
+    String line = weatherTxt;
+    if (age > WEATHER_FRESH_SEC) {
+      char ageBuf[16];
+      if (age < 3600) snprintf(ageBuf, sizeof(ageBuf), " (%ldm old)", age / 60);
+      else snprintf(ageBuf, sizeof(ageBuf), " (%ldh old)", age / 3600);
+      line += ageBuf;
     }
+    display.drawString("  " + line + "  ", 120, 138);
 
     // High/Low spelled out at the medium size, one per line — the pair
     // won't fit on a single line at this size, and stacking them leaves
