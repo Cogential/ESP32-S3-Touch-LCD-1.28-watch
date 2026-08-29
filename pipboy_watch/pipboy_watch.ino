@@ -87,27 +87,29 @@ static const uint32_t IDLE_DIM_TIMEOUT_MS = 8000; // dim backlight after 8s of n
 // IMU — not worth paying for while nothing reads it. On (costs the extra
 // current) because raise-to-wake, below, is the thing that reads it now.
 static const bool GYRO_ENABLED = true;
+// Periodic accel/gyro logging, used to calibrate raise-to-wake against the
+// board's real axis convention rather than an assumed one. Set false once
+// the thresholds below are settled.
+static const bool IMU_TRACE = true;
 
 // ---------- raise-to-wake (gyro) ----------
-// Same situation as the swipe-axis knobs just below: this board's QMI8658
-// mounting orientation relative to "screen facing you when you look at your
-// wrist" hasn't been verified against real hardware, so these are
-// reasoned-guess defaults, not measured ones. If it never triggers (or
-// triggers on the wrong motion, e.g. every arm swing while walking), the
-// fix is the same kind of one-time calibration as the swipe knobs: log
-// gx/gy/gz and ax/ay/az to Serial, deliberately raise the wrist to look at
-// the watch a few times, and adjust the values below to match what's
-// actually observed.
-static const float RAISE_GYRO_THRESHOLD_DPS = 150.0f; // rotation speed that counts as "an active wrist turn", not ambient jitter
-static const uint32_t RAISE_GYRO_MIN_MS = 80;          // must sustain that rotation at least this long — filters brief spikes/knocks
-static const uint32_t RAISE_GYRO_MAX_MS = 700;         // ...but a real raise is a quick flick, not a slow drift — cap it too
-// Gravity vector (m/s^2) the accelerometer should read once the watch has
-// settled face-up toward you. Default guess: Z points straight out of the
-// screen, so looking at the watch aligns Z with gravity and X/Y with ~0.
+// Calibrated against the real board (see IMU_TRACE): resting face-up it
+// reads a = (-1.6, 9.8, 1.9) m/s^2, i.e. gravity lands on +Y, so +Y is the
+// axis pointing out of the screen. The first version of this guessed +Z and
+// consequently never fired — the dot product below sat near zero no matter
+// how the watch was moved.
+static const float RAISE_GYRO_THRESHOLD_DPS = 80.0f; // rotation speed that counts as an active wrist turn, not ambient jitter
+static const uint32_t RAISE_GYRO_MIN_MS = 50;        // must sustain that rotation this long — filters brief knocks
+static const uint32_t RAISE_GYRO_MAX_MS = 1500;      // ...but a raise is a flick, not a slow drift — cap it too
+// Gravity vector (m/s^2) expected once the watch settles with the screen
+// toward you. Measured convention above: screen normal is +Y.
 static const float RAISE_ACCEL_TARGET_X = 0.0f;
-static const float RAISE_ACCEL_TARGET_Y = 0.0f;
-static const float RAISE_ACCEL_TARGET_Z = 9.8f;
-static const float RAISE_ACCEL_DOT_MIN = 0.85f; // cosine similarity to the target above; 1.0 = exact match, lower = more lenient
+static const float RAISE_ACCEL_TARGET_Y = 9.8f;
+static const float RAISE_ACCEL_TARGET_Z = 0.0f;
+// Cosine similarity to that target; 1.0 = screen exactly level and facing
+// straight up. A wrist held at a natural viewing angle is tilted well off
+// level, so this has to be forgiving — 0.5 accepts anything within ~60°.
+static const float RAISE_ACCEL_DOT_MIN = 0.5f;
 static const uint32_t RAISE_COOLDOWN_MS = 1500; // minimum gap between two raise-to-wake triggers
 
 // ---------- swipe navigation ----------
@@ -202,6 +204,7 @@ static const time_t WEATHER_FRESH_SEC = 15 * 60;
 float gyroX = 0, gyroY = 0, gyroZ = 0;
 
 uint32_t lastImuPollMs = 0;
+uint32_t lastImuTraceMs = 0;
 uint32_t lastSaveMs = 0;
 // RTC_DATA_ATTR survives deep sleep (backed by RTC slow memory, unlike
 // regular globals which reset every wake) but not a full power cycle — that
@@ -219,6 +222,7 @@ int lastRenderedSecond = -1;
 // ---------- raise-to-wake state ----------
 bool raiseGyroActive = false;   // currently inside a rotation burst above RAISE_GYRO_THRESHOLD_DPS
 uint32_t raiseGyroStartMs = 0;  // when the current burst began
+float raiseGyroPeak = 0;        // fastest rotation seen during it, for calibration logging
 uint32_t lastRaiseWakeMs = 0;   // last time raise-to-wake actually fired, for RAISE_COOLDOWN_MS
 
 // ---------- BLE ----------
@@ -799,22 +803,34 @@ void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now)
   if (fastNow && !raiseGyroActive) {
     raiseGyroActive = true;
     raiseGyroStartMs = now;
+    raiseGyroPeak = gyroMag;
+  } else if (fastNow && raiseGyroActive) {
+    if (gyroMag > raiseGyroPeak) raiseGyroPeak = gyroMag;
   } else if (!fastNow && raiseGyroActive) {
     uint32_t heldMs = now - raiseGyroStartMs;
+    float peak = raiseGyroPeak;
     raiseGyroActive = false;
 
     bool durationLooksRight = heldMs >= RAISE_GYRO_MIN_MS && heldMs <= RAISE_GYRO_MAX_MS;
     bool offCooldown = now - lastRaiseWakeMs > RAISE_COOLDOWN_MS;
-    if (durationLooksRight && offCooldown && accelOk) {
-      float amag = sqrtf(ax * ax + ay * ay + az * az);
-      if (amag > 0.1f) { // guard the divide below against a bogus all-zero reading
-        float dot = (ax * RAISE_ACCEL_TARGET_X + ay * RAISE_ACCEL_TARGET_Y + az * RAISE_ACCEL_TARGET_Z) / (amag * 9.8f);
-        if (dot > RAISE_ACCEL_DOT_MIN) {
-          wakeScreen(now);
-          lastRaiseWakeMs = now;
-          Serial.println("[pipboy] raise-to-wake triggered.");
-        }
-      }
+    float amag = sqrtf(ax * ax + ay * ay + az * az);
+    float dot = (accelOk && amag > 0.1f)
+                    ? (ax * RAISE_ACCEL_TARGET_X + ay * RAISE_ACCEL_TARGET_Y + az * RAISE_ACCEL_TARGET_Z) / (amag * 9.8f)
+                    : -9.0f;
+
+    // Every candidate motion is logged, fired or not, with the numbers each
+    // gate actually saw. The thresholds and the target orientation were
+    // guesses about how this IMU is mounted relative to "screen facing
+    // you"; this is what turns them into measured values. ax/ay/az here is
+    // the settled orientation at the end of the motion.
+    Serial.printf("[pipboy] raise? held=%lums peak=%.0fdps a=(%.1f,%.1f,%.1f) dot=%.2f dur=%d cool=%d\n",
+                  (unsigned long)heldMs, peak, ax, ay, az, dot,
+                  durationLooksRight, offCooldown);
+
+    if (durationLooksRight && offCooldown && dot > RAISE_ACCEL_DOT_MIN) {
+      wakeScreen(now);
+      lastRaiseWakeMs = now;
+      Serial.println("[pipboy] raise-to-wake triggered.");
     }
   }
 }
@@ -1549,6 +1565,17 @@ void loop() {
       // skips the extra math the rest of the time, and sidesteps the whole
       // "what if a burst spans a wake that happened some other way" question.
       if (backlightDimmed) updateRaiseToWake(accelOk, ax, ay, az, now);
+
+      // Temporary calibration aid (IMU_TRACE): raise-to-wake's thresholds
+      // and its idea of "screen facing you" were guesses about how this
+      // IMU is mounted, and guessing the sign of one axis wrong is enough
+      // to stop it ever firing. Logging the vectors periodically is what
+      // turns that into a measurement. Turn off once calibrated.
+      if (IMU_TRACE && now - lastImuTraceMs >= 1000) {
+        lastImuTraceMs = now;
+        Serial.printf("[pipboy] imu a=(%.1f,%.1f,%.1f) g=(%.0f,%.0f,%.0f) dim=%d\n",
+                      ax, ay, az, gyroX, gyroY, gyroZ, backlightDimmed);
+      }
     }
   }
 
@@ -1615,7 +1642,7 @@ void loop() {
 
     } else if (!stableDown && prevTouchDown) {
       // Finger lifted — this is where every gesture is resolved.
-      if (!touchWasDimWake) {
+      {
         int16_t rawDx = touchLastX - touchStartX;
         int16_t rawDy = touchLastY - touchStartY;
         int16_t visualSwipe = SWIPE_AXIS_IS_RAW_Y ? rawDy : rawDx;
@@ -1623,7 +1650,17 @@ void loop() {
         uint32_t heldMs = now - touchDownStartMs;
         bool heldStill = abs(rawDx) < 15 && abs(rawDy) < 15;
 
-        if (abs(visualSwipe) >= SWIPE_MIN_DIST) {
+        Serial.printf("[pipboy] lift: held=%lums dx=%d dy=%d screen=%u dimWake=%d\n",
+                      (unsigned long)heldMs, rawDx, rawDy, currentScreen, touchWasDimWake);
+
+        // A touch that woke the dimmed screen is barred from *navigating*
+        // — you shouldn't land on a different screen just for looking at
+        // the watch. It is NOT barred from long-press actions: holding
+        // still for three full seconds is unambiguous intent, and gating
+        // those on the screen already being lit made them nearly
+        // impossible to trigger in practice, since the backlight dims
+        // after 8s and almost every real press therefore starts dimmed.
+        if (abs(visualSwipe) >= SWIPE_MIN_DIST && !touchWasDimWake) {
           if (visualSwipe > 0) currentScreen = (currentScreen + 1) % NUM_SCREENS;
           else currentScreen = (currentScreen + NUM_SCREENS - 1) % NUM_SCREENS;
           notifAutoShown = false; // user's driving now, stop the auto-revert timer
@@ -1691,16 +1728,19 @@ void loop() {
   }
 
   // A clock only needs to redraw when the second (or screen/state) changes —
-  // keeps things flicker-free without needing a second framebuffer. And
-  // skip it entirely while the backlight is dimmed to near-invisible: a
-  // redraw nobody can see burns CPU/SPI time for zero benefit, ~86,400
-  // times a day whenever the watch sits idle. Nothing is lost by
-  // deferring — waking always sets forceRedraw=true, so the very next
-  // frame after a touch is already guaranteed correct.
+  // keeps things flicker-free without needing a second framebuffer.
+  //
+  // This deliberately keeps redrawing while the backlight is dimmed. An
+  // earlier version skipped those frames to save power, on the assumption
+  // that a dimmed screen is effectively invisible. It isn't: BRIGHT_DIM is
+  // low but perfectly readable, so skipping froze the clock mid-tick and
+  // stalled the step count until something happened to wake the watch. A
+  // watch face that lies about the time to save a little current is a bad
+  // trade.
   time_t nowSec = time(nullptr);
   struct tm t;
   localtime_r(&nowSec, &t);
-  if (!backlightDimmed && (forceRedraw || t.tm_sec != lastRenderedSecond)) {
+  if (forceRedraw || t.tm_sec != lastRenderedSecond) {
     render(forceRedraw);
     lastRenderedSecond = t.tm_sec;
     forceRedraw = false;
