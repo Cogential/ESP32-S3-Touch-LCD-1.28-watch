@@ -764,23 +764,55 @@ static const int BATT_UNKNOWN = -1;
 static const int BATT_MIN_PLAUSIBLE_MV = 2800; // below a LiPo's protection cutoff
 static const int BATT_MAX_PLAUSIBLE_MV = 4350; // above a full cell plus charge headroom
 
+// A LiPo's voltage/charge relationship is markedly non-linear: it falls
+// quickly off the top, sits on a long plateau through the middle, then
+// drops away at the bottom. The straight line this replaced under-read the
+// plateau badly — most of a cell's usable life is spent between 3.7V and
+// 4.0V, which a linear 3.3-4.2V map compresses into a third of the scale.
+//
+// Note these are *resting* voltages. The watch never stops drawing current,
+// so every reading is taken under load and sits a little below the true
+// state of charge. No attempt is made to compensate for that: the offset
+// depends on the load at that instant, and inventing a correction factor
+// would be guessing dressed up as precision.
+int lipoPercent(int mv) {
+  static const struct { int mv; int pct; } curve[] = {
+    {4200, 100}, {4100, 90}, {4000, 80}, {3950, 70}, {3900, 60}, {3850, 50},
+    {3800, 40}, {3750, 30}, {3700, 20}, {3600, 10}, {3300, 0},
+  };
+  const uint8_t n = sizeof(curve) / sizeof(curve[0]);
+  if (mv >= curve[0].mv) return 100;
+  if (mv <= curve[n - 1].mv) return 0;
+  for (uint8_t i = 0; i + 1 < n; i++) {
+    if (mv <= curve[i].mv && mv > curve[i + 1].mv) {
+      int span = curve[i].mv - curve[i + 1].mv;
+      int into = mv - curve[i + 1].mv;
+      return curve[i + 1].pct + (curve[i].pct - curve[i + 1].pct) * into / span;
+    }
+  }
+  return 0;
+}
+
 int readBatteryPercent() {
   static int cachedPct = BATT_UNKNOWN;
   static uint32_t lastReadMs = 0;
   static bool everRead = false;
   uint32_t now = millis();
   if (!everRead || now - lastReadMs > 30000) {
-    int mv = analogReadMilliVolts(PIN_BATT_ADC) * 3; // 200k/100k divider
+    // Averaged: a single ESP32 ADC read carries several tens of mV of
+    // noise, which on a LiPo curve is worth a percent or two of jitter —
+    // enough to make the displayed number wander while nothing is
+    // happening.
+    uint32_t acc = 0;
+    for (uint8_t i = 0; i < 8; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
+    int mv = (int)(acc / 8) * 3; // 200k/100k divider
     everRead = true;
     lastReadMs = now;
     if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
       Serial.printf("[pipboy] battery: %dmV -> no plausible cell, reporting unknown\n", mv);
       cachedPct = BATT_UNKNOWN;
     } else {
-      float pct = (mv - 3300) / (4200.0f - 3300.0f) * 100.0f; // rough LiPo curve
-      if (pct < 0) pct = 0;
-      if (pct > 100) pct = 100;
-      cachedPct = (int)(pct + 0.5f);
+      cachedPct = lipoPercent(mv);
       Serial.printf("[pipboy] battery: %dmV -> %d%%\n", mv, cachedPct);
     }
   }
@@ -1022,10 +1054,12 @@ String fitToWidth(const String &s, int maxW) {
 
 // Bluetooth rune, traced from the real logo (spine + one zigzag flag) and
 // drawn with anti-aliased lines instead of the old plain on/off dot.
-void drawBluetoothIcon(int cx, int cy, bool connected) {
+void drawBluetoothIcon(int cx, int cy, bool connected, uint16_t accent = COL_GREEN) {
   const float w = 8, h = 14;
   float x0 = cx - w / 2, y0 = cy - h / 2;
-  uint16_t col = connected ? COL_GREEN : COL_GREEN_DIM;
+  // Dim still means "not connected" — that's state, not decoration, so it
+  // survives the per-screen tinting.
+  uint16_t col = connected ? accent : COL_GREEN_DIM;
   float topX = x0 + w / 2, topY = y0;
   float ctrX = x0 + w / 2, ctrY = y0 + h / 2;
   float botX = x0 + w / 2, botY = y0 + h;
@@ -1045,11 +1079,11 @@ void drawBluetoothIcon(int cx, int cy, bool connected) {
 
 // Battery glyph (rounded outline + terminal nub + proportional fill bar)
 // instead of the old "BATT 82%" text label.
-void drawBatteryIcon(int x, int y, int pct) {
+void drawBatteryIcon(int x, int y, int pct, uint16_t accent = COL_GREEN) {
   const int BW = 20, BH = 11, RAD = 3, NUBW = 2, NUBH = 5, BORDER = 2, INSET = 2;
-  display.fillSmoothRoundRect(x, y, BW, BH, RAD, COL_GREEN_DIM);
+  display.fillSmoothRoundRect(x, y, BW, BH, RAD, accent);
   display.fillSmoothRoundRect(x + BORDER, y + BORDER, BW - 2 * BORDER, BH - 2 * BORDER, RAD - BORDER, COL_BG);
-  display.fillRect(x + BW, y + (BH - NUBH) / 2, NUBW, NUBH, COL_GREEN_DIM);
+  display.fillRect(x + BW, y + (BH - NUBH) / 2, NUBW, NUBH, accent);
 
   if (pct == BATT_UNKNOWN) return; // empty shell — no cell to represent
 
@@ -1058,7 +1092,9 @@ void drawBatteryIcon(int x, int y, int pct) {
   if (fw < 0) fw = 0;
   if (fw > innerW) fw = innerW;
   if (fw > 0) {
-    uint16_t col = pct > 20 ? COL_GREEN : COL_AMBER;
+    // Amber below 20% regardless of the section's colour — a nearly flat
+    // battery should look the same wherever you happen to be looking.
+    uint16_t col = pct > 20 ? accent : COL_AMBER;
     display.fillRect(x + BORDER + INSET, y + BORDER + INSET, fw, BH - 2 * BORDER - 2 * INSET, col);
   }
 }
@@ -1082,9 +1118,9 @@ void drawBleBattCluster(int battPct, uint16_t col = COL_GREEN) {
   int startX = 120 - totalW / 2;
   int rowY = 213;
 
-  drawBluetoothIcon(startX + BT_W / 2, rowY, bleConnected);
+  drawBluetoothIcon(startX + BT_W / 2, rowY, bleConnected, col);
   int battX = startX + BT_W + GAP1;
-  drawBatteryIcon(battX, rowY - 5, battPct);
+  drawBatteryIcon(battX, rowY - 5, battPct, col);
   display.setTextDatum(middle_left);
   display.setTextColor(col, COL_BG);
   display.drawString(pctbuf, battX + BATT_W + GAP2, rowY);
