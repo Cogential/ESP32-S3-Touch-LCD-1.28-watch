@@ -7,9 +7,11 @@ profiles:
       - platform: esp32:esp32 (3.3.11)
         platform_index_url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
     libraries:
+      # Preferences and BLE ship bundled with the esp32 core itself (pinned
+      # above via the platform version) — listing them here as if they were
+      # separate Library Manager packages just makes arduino-cli warn that
+      # it can't find them, harmlessly, on every compile.
       - QMI8658 (1.0.1)
-      - Preferences (3.3.11)
-      - BLE (3.3.11)
       - ArduinoJson (7.4.3)
       - LovyanGFX (1.2.27)
       - WiFiManager (2.0.17)

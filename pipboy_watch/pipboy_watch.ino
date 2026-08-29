@@ -1,9 +1,14 @@
 // PIP-BOY 3000 watch face for the Waveshare ESP32-S3-Touch-LCD-1.28
 //
-// - Round GC9A01 display, green-phosphor CRT look, three screens (tap to
-//   cycle): STAT (clock + weather), DATA (steps), NOTIF (latest phone
-//   notification).
-// - Step counting from the onboard QMI8658 accelerometer.
+// - Round GC9A01 display, green-phosphor CRT look, four screens (tap to
+//   cycle): STAT (clock + weather one-liner), DATA (steps), WEATHER (full
+//   temp/hi-lo/condition), NOTIF (latest phone notification).
+// - Step counting from the onboard QMI8658 accelerometer; the gyro is read
+//   too (gyroX/Y/Z) but not yet consumed by anything.
+// - No physical power switch on this board — long-press-and-hold (3s,
+//   finger still) on the DATA screen puts it into a real ESP32 deep sleep
+//   instead, waking back up on the next touch. See enterDeepSleep() and the
+//   wake-from-sleep fast path near the top of setup().
 // - Time comes from WiFi + NTP on boot (this board has no RTC chip), then
 //   WiFi is switched off to save power. Re-syncs periodically in case the
 //   software clock drifts. No SSID/password is hardcoded: WiFiManager opens
@@ -39,6 +44,7 @@
 #include <BLE2902.h>
 #include <ArduinoJson.h>
 #include <time.h>
+#include <esp_sleep.h>
 
 #include "LGFX_Config.hpp"
 #include "Touch_CST816S.h"
@@ -54,7 +60,12 @@
 // switch onto your phone's hotspot. See wifiConnectOrSetup() /
 // forceWifiSetupPortal() below.
 static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
-static const uint32_t WIFI_SETUP_LONG_PRESS_MS = 3000; // hold this long to open the portal
+
+// ---------- long-press gestures ----------
+// This board has no physical power switch, and the long-press-and-hold
+// gesture is shared by two different actions depending which screen it's
+// done on — see the long-press handling in loop().
+static const uint32_t LONG_PRESS_MS = 3000; // hold this long, finger still, to trigger either one
 // POSIX TZ string for America/Toronto — handles EST/EDT DST automatically.
 static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
 static const uint32_t WIFI_RESYNC_INTERVAL_MS = 4UL * 60 * 60 * 1000; // 4h
@@ -102,9 +113,10 @@ bool imuOk = false;
 
 volatile bool bleConnected = false;
 volatile bool timeSynced = false;
-uint8_t currentScreen = 0; // 0 = STAT (clock), 1 = DATA (steps), 2 = NOTIF
-const uint8_t NUM_SCREENS = 3;
-const uint8_t SCREEN_NOTIF = 2;
+uint8_t currentScreen = 0; // 0 = STAT (clock), 1 = DATA (steps), 2 = WEATHER, 3 = NOTIF
+const uint8_t NUM_SCREENS = 4;
+const uint8_t SCREEN_WEATHER = 2;
+const uint8_t SCREEN_NOTIF = 3;
 bool prevTouchDown = false;   // debounced/stable state used for edge detection
 uint8_t touchDownStreak = 0;  // consecutive raw "down" reads in a row
 uint32_t lastTouchPollMs = 0;
@@ -469,6 +481,32 @@ void saveState() {
   prefs.end();
 }
 
+// ---------- power ----------
+// This board has no physical power switch, so this is the closest
+// equivalent: a real ESP32 deep sleep (CPU, display, radios all powered
+// down — this is what actually saves battery, unlike the backlight-only
+// dim the idle timeout does) that wakes back up on the next touch. Deep
+// sleep is a full reset — everything except the RTC timer and flash-backed
+// state loses power, so the only way back is through setup() again from the
+// top. See the wake-from-sleep fast path near the top of setup().
+void enterDeepSleep() {
+  Serial.println("[pipboy] long-press on DATA screen -> entering deep sleep...");
+  saveState(); // catch any steps counted since the last periodic save
+
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.endWrite();
+  display.setBrightness(0);
+  delay(50); // let the backlight PWM actually settle to off before power drops
+
+  // CST816S holds its INT pin high and pulses it low on a touch event —
+  // ext0 wakes the chip the moment that pin goes low. GPIO5 is within the
+  // S3's low-power IO domain, which ext0 requires.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOUCH_INT, 0);
+  esp_deep_sleep_start();
+  // Never reaches here — the reset vector (setup()) is the only way out.
+}
+
 // ---------- drawing helpers ----------
 
 // Sharp bold monospace face for everything except the time (which stays on
@@ -607,6 +645,47 @@ void drawDataScreen(int steps, int battPct) {
   drawBleBattCluster(battPct);
 }
 
+// Fuller weather view than the compact line embedded in STAT — same data
+// (hasWeather/weatherTempC/etc., fed over BLE by Gadgetbridge, see
+// handleGadgetbridgeLine()), laid out like DATA's big-number-plus-detail
+// style instead of squeezed into one line.
+void drawWeatherScreen(int battPct) {
+  display.setTextDatum(middle_center);
+
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("Weather", 120, 80);
+
+  if (!hasWeather) {
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString("-- NO DATA --", 120, 120);
+    useSharpSmallFont();
+    display.drawString("pair Gadgetbridge to", 120, 148);
+    display.drawString("enable weather sync", 120, 168);
+  } else {
+    char tempbuf[12];
+    snprintf(tempbuf, sizeof(tempbuf), "%dC", weatherTempC);
+    display.setTextColor(COL_GREEN, COL_BG);
+    display.setFont(&fonts::Font7);
+    display.setTextSize(0.85f);
+    display.drawString(tempbuf, 120, 120);
+    display.setTextSize(1.0f);
+
+    useSharpSmallFont();
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    char hiloBuf[24];
+    snprintf(hiloBuf, sizeof(hiloBuf), "HI %d   LO %d", weatherHiC, weatherLoC);
+    display.drawString(hiloBuf, 120, 168);
+
+    if (weatherTxt.length()) {
+      display.setTextColor(COL_GREEN, COL_BG);
+      display.drawString(weatherTxt, 120, 190);
+    }
+  }
+
+  drawBleBattCluster(battPct);
+}
+
 // Draws `text` word-wrapped inside a `maxWidth`-px column, centered,
 // starting at `y`, one line per `lineHeight` px. Returns nothing — just
 // best-effort fits what it can in `maxLines`.
@@ -729,6 +808,7 @@ void render(bool fullClear) {
 
   if (currentScreen == 0) drawStatScreen(t, steps, battPct);
   else if (currentScreen == 1) drawDataScreen(steps, battPct);
+  else if (currentScreen == SCREEN_WEATHER) drawWeatherScreen(battPct);
   else drawNotifScreen(battPct);
   display.endWrite();
 }
@@ -738,6 +818,15 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n[pipboy] boot");
+
+  // Deep sleep (enterDeepSleep(), triggered by a long-press on the DATA
+  // screen — this board's only "power button") is a full reset: everything
+  // except the RTC timer and flash-backed state loses power, and setup()
+  // is the only way back. Detect that case so wake can skip the slow parts
+  // (flicker animation, WiFi+NTP round trip) instead of paying full boot
+  // cost every time you just want to glance at the time.
+  bool wokeFromSleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
+  if (wokeFromSleep) Serial.println("[pipboy] waking from deep sleep (touch)...");
 
   // Load the DST-aware timezone rule unconditionally, independent of
   // WiFi — BLE time sync (from Gadgetbridge, see handleGadgetbridgeLine)
@@ -758,9 +847,17 @@ void setup() {
   display.setBrightness(BRIGHT_ACTIVE);
   lastActivityMs = millis();
 
-  // Boot splash drawn immediately, independent of everything else below,
-  // so the panel/SPI path is proven working before we touch I2C at all.
-  playBootAnimation();
+  // Boot splash drawn immediately, independent of everything else below, so
+  // the panel/SPI path is proven working before we touch I2C at all — but
+  // skip the multi-second flicker-in on a sleep wake, where it'd just be an
+  // annoying delay between "touched the watch" and "screen shows something".
+  if (wokeFromSleep) {
+    display.startWrite();
+    display.fillScreen(COL_BG);
+    display.endWrite();
+  } else {
+    playBootAnimation();
+  }
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   // (WiFi/NTP sync happens further down, after touch+IMU are probed, so
@@ -812,17 +909,30 @@ void setup() {
   setupBLE();
   drawLoadingBar(60);
 
-  bool wifiOk = wifiConnectOrSetup();
-  lastWifiSyncMs = millis();
+  bool wifiOk;
+  if (wokeFromSleep) {
+    // The RTC domain (and the calendar clock it drives, via time()) stays
+    // powered through deep sleep — only regular RAM resets, which is why
+    // timeSynced itself comes back false here even though the underlying
+    // clock is still correct. Trust it instead of paying for a full WiFi+
+    // NTP round trip on every single wake; the periodic 4h resync (when the
+    // watch stays awake that long) is still there to correct any drift.
+    timeSynced = (time(nullptr) > 1700000000);
+    wifiOk = timeSynced;
+    Serial.printf("[pipboy] skipping WiFi on wake, clock looks %s\n", timeSynced ? "valid" : "INVALID");
+  } else {
+    wifiOk = wifiConnectOrSetup();
+    lastWifiSyncMs = millis();
 
-  // wifiConnectOrSetup() may have taken over the whole screen for the setup
-  // portal — redraw the boot background underneath the final loading-bar
-  // state so that screen doesn't show through.
-  display.startWrite();
-  display.fillScreen(COL_BG);
-  drawVaultBoy((240 - VAULTBOY_W) / 2, 6, 255);
-  display.endWrite();
-  drawLoadingBar(100, wifiOk);
+    // wifiConnectOrSetup() may have taken over the whole screen for the
+    // setup portal — redraw the boot background underneath the final
+    // loading-bar state so that screen doesn't show through.
+    display.startWrite();
+    display.fillScreen(COL_BG);
+    drawVaultBoy((240 - VAULTBOY_W) / 2, 6, 255);
+    display.endWrite();
+    drawLoadingBar(100, wifiOk);
+  }
 
   if (!dispOk) {
     useSharpSmallFont();
@@ -840,7 +950,9 @@ void setup() {
     display.drawString("NO IMU", 170, 222);
   }
 
-  delay(600);
+  // Skip the settle delay on a sleep wake — the whole point of that path is
+  // getting back to something useful on screen as fast as possible.
+  if (!wokeFromSleep) delay(600);
   Serial.println("[pipboy] PIP-BOY 3000 online.");
 }
 
@@ -903,15 +1015,21 @@ void loop() {
       touchLastY = ty;
       lastActivityMs = now;
 
-      // Long-press-and-hold (finger essentially stationary) opens the WiFi
-      // setup portal — a deliberate, hard-to-trigger-by-accident gesture,
-      // since it's disruptive (takes over the screen, opens a hotspot).
-      if (!touchWasDimWake && !longPressConsumed) {
+      // Long-press-and-hold (finger essentially stationary) does one of two
+      // screen-dependent things — both deliberately disruptive/hard to
+      // trigger by accident, so they're gated behind a hold, not a tap:
+      //   STAT (0) -> reopen the WiFi setup portal
+      //   DATA (1) -> deep sleep (this board's only "power button")
+      // Every other screen: long-press does nothing.
+      if (!touchWasDimWake && !longPressConsumed && (currentScreen == 0 || currentScreen == 1)) {
         int16_t driftX = touchLastX - touchStartX;
         int16_t driftY = touchLastY - touchStartY;
         bool heldStill = abs(driftX) < 15 && abs(driftY) < 15;
-        if (heldStill && now - touchDownStartMs >= WIFI_SETUP_LONG_PRESS_MS) {
+        if (heldStill && now - touchDownStartMs >= LONG_PRESS_MS) {
           longPressConsumed = true;
+          if (currentScreen == 1) {
+            enterDeepSleep(); // never returns — next code that runs is setup()
+          }
           forceWifiSetupPortal();
           // Minutes may have passed inside that blocking call — the touch
           // chip's idea of "finger down" is stale, so start clean rather
