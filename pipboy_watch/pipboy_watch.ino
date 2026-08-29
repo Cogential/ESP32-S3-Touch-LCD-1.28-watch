@@ -792,6 +792,80 @@ void drawBleBattCluster(int battPct) {
   display.setTextDatum(middle_center);
 }
 
+// ---------- temperature rendering ----------
+// Two things make a plain "23°C" string impossible to just drawString():
+//   1. Font7 is the 7-segment face — digits only, no letters at all, so a
+//      "C" appended to the number silently vanishes (this is exactly why
+//      the big temperature used to render as a bare number).
+//   2. None of the fonts here have a degree glyph — the Adafruit GFX
+//      FreeMono faces stop at 0x7E.
+// So the number, the degree ring, and the "C" are drawn as three separate
+// pieces, measured and laid out as one centered group.
+
+// Big Font7 temperature with a small degree+C to its right, centered on cx.
+void drawBigTempC(int cx, int cy, int tempC) {
+  char numbuf[8];
+  snprintf(numbuf, sizeof(numbuf), "%d", tempC);
+
+  display.setFont(&fonts::Font7);
+  display.setTextSize(0.85f);
+  int numW = display.textWidth(numbuf);
+  display.setTextSize(1.0f);
+
+  useSharpMedFont();
+  int cW = display.textWidth("C");
+
+  const int GAP = 8, RING_R = 5, RING_GAP = 4;
+  int totalW = numW + GAP + RING_R * 2 + RING_GAP + cW;
+  int x = cx - totalW / 2;
+
+  display.setTextDatum(middle_left);
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.setFont(&fonts::Font7);
+  display.setTextSize(0.85f);
+  display.drawString(numbuf, x, cy);
+  display.setTextSize(1.0f);
+
+  // Ring sits up near the top of the digits, the way a degree mark reads.
+  int ringX = x + numW + GAP + RING_R;
+  int ringY = cy - 13;
+  display.drawCircle(ringX, ringY, RING_R, COL_GREEN);
+  display.drawCircle(ringX, ringY, RING_R - 1, COL_GREEN); // doubled so it survives at this size
+
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString("C", ringX + RING_R + RING_GAP, cy);
+  display.setTextDatum(middle_center);
+}
+
+// Small one-line "23°C  clear sky" row, centered on cx. Same three-piece
+// trick as drawBigTempC(), at the small text size.
+void drawSmallTempRow(int cx, int cy, int tempC, const String &desc, uint16_t col) {
+  useSharpSmallFont();
+  char numbuf[8];
+  snprintf(numbuf, sizeof(numbuf), "%d", tempC);
+  String tail = desc.length() ? ("  " + desc) : "";
+
+  int numW = display.textWidth(numbuf);
+  int cW = display.textWidth("C");
+  int tailW = tail.length() ? display.textWidth(tail) : 0;
+
+  const int GAP = 3, RING_R = 2, RING_GAP = 2;
+  int totalW = numW + GAP + RING_R * 2 + RING_GAP + cW + tailW;
+  int x = cx - totalW / 2;
+
+  display.setTextDatum(middle_left);
+  display.setTextColor(col, COL_BG);
+  display.drawString(numbuf, x, cy);
+  x += numW + GAP + RING_R;
+  display.drawCircle(x, cy - 5, RING_R, col);
+  x += RING_R + RING_GAP;
+  display.drawString("C", x, cy);
+  x += cW;
+  if (tail.length()) display.drawString(tail, x, cy);
+  display.setTextDatum(middle_center);
+}
+
 void drawStatScreen(struct tm &t, int steps, int battPct) {
   display.setTextDatum(middle_center);
 
@@ -822,13 +896,14 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
   useSharpSmallFont();
   display.drawString(datebuf, 120, 168);
 
-  char weatherbuf[28];
+  // Current temperature + condition only — the high/low pair lives on the
+  // dedicated WEATHER screen, where there's room to label it properly.
   if (hasWeather) {
-    snprintf(weatherbuf, sizeof(weatherbuf), "%dC  HI%d LO%d  %s", weatherTempC, weatherHiC, weatherLoC, weatherTxt.c_str());
+    drawSmallTempRow(120, 192, weatherTempC, weatherTxt, COL_GREEN_DIM);
   } else {
-    snprintf(weatherbuf, sizeof(weatherbuf), "                    "); // blank until Gadgetbridge sends one
+    // Blank the row so a stale reading can't linger between redraws.
+    display.drawString("                    ", 120, 192);
   }
-  display.drawString(weatherbuf, 120, 192);
 
   drawBleBattCluster(battPct);
 }
@@ -865,7 +940,7 @@ void drawWeatherScreen(int battPct) {
 
   useSharpMedFont();
   display.setTextColor(COL_GREEN_DIM, COL_BG);
-  display.drawString("Weather", 120, 80);
+  display.drawString("Weather", 120, hasWeather ? 56 : 80);
 
   if (!hasWeather) {
     display.setTextColor(COL_GREEN_DIM, COL_BG);
@@ -880,24 +955,24 @@ void drawWeatherScreen(int battPct) {
     display.drawString("feeding Gadgetbridge", 120, 168);
     display.drawString("e.g. Breezy Weather", 120, 188);
   } else {
-    char tempbuf[12];
-    snprintf(tempbuf, sizeof(tempbuf), "%dC", weatherTempC);
-    display.setTextColor(COL_GREEN, COL_BG);
-    display.setFont(&fonts::Font7);
-    display.setTextSize(0.85f);
-    display.drawString(tempbuf, 120, 120);
-    display.setTextSize(1.0f);
-
-    useSharpSmallFont();
-    display.setTextColor(COL_GREEN_DIM, COL_BG);
-    char hiloBuf[24];
-    snprintf(hiloBuf, sizeof(hiloBuf), "HI %d   LO %d", weatherHiC, weatherLoC);
-    display.drawString(hiloBuf, 120, 168);
+    drawBigTempC(120, 100, weatherTempC);
 
     if (weatherTxt.length()) {
+      useSharpSmallFont();
       display.setTextColor(COL_GREEN, COL_BG);
-      display.drawString(weatherTxt, 120, 190);
+      display.drawString(weatherTxt, 120, 138);
     }
+
+    // High/Low spelled out at the medium size, one per line — the pair
+    // won't fit on a single line at this size, and stacking them leaves
+    // clearance above the BLE/battery cluster at y=213.
+    useSharpMedFont();
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    char hiBuf[16], loBuf[16];
+    snprintf(hiBuf, sizeof(hiBuf), "High: %d", weatherHiC);
+    snprintf(loBuf, sizeof(loBuf), "Low: %d", weatherLoC);
+    display.drawString(hiBuf, 120, 166);
+    display.drawString(loBuf, 120, 190);
   }
 
   drawBleBattCluster(battPct);
@@ -942,8 +1017,17 @@ void drawNotifScreen(int battPct) {
   if (!hasNotif) {
     display.setTextColor(COL_GREEN_DIM, COL_BG);
     display.drawString("-- NONE YET --", 120, 120);
-    display.drawString("pair Gadgetbridge to", 120, 142);
-    display.drawString("start receiving these", 120, 162);
+    // The setup hint is only useful before there's a phone connected —
+    // once BLE is up, "none yet" just means nothing has arrived, and the
+    // instructions are noise.
+    if (!bleConnected) {
+      display.drawString("pair Gadgetbridge to", 120, 142);
+      display.drawString("start receiving these", 120, 162);
+    } else {
+      // Clear whatever the hint left behind on the previous frame.
+      display.drawString("                     ", 120, 142);
+      display.drawString("                     ", 120, 162);
+    }
   } else {
     display.setTextColor(COL_GREEN, COL_BG);
     display.drawString(notifSrc.length() ? notifSrc : "NOTIFICATION", 120, 70);
