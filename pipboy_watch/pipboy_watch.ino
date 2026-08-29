@@ -134,6 +134,9 @@ static const uint32_t RAISE_COOLDOWN_MS = 1500; // minimum gap between two raise
 // diagonal once tested on the real hardware:
 static const bool SWIPE_AXIS_IS_RAW_Y = true;  // true: raw Y delta = visual horizontal swipe
 static const bool SWIPE_INVERT = false;        // flip if left/right come out reversed
+// Direction of the perpendicular (notification-scrolling) swipe. Same kind
+// of one-line knob as SWIPE_INVERT above: flip if scrolling feels backwards.
+static const bool VSWIPE_INVERT = false;
 static const int16_t SWIPE_MIN_DIST = 35;      // px of raw movement to count as a swipe, not a tap
 
 // ---------- pins ----------
@@ -180,10 +183,20 @@ uint32_t notifAutoRevertMs = 0; // when a popped-up notification should hide its
 bool notifAutoShown = false;
 
 // ---------- notification + weather state (from Gadgetbridge) ----------
-String notifSrc = "";
-String notifTitle = "";
-String notifBody = "";
-bool hasNotif = false;
+// Notifications are kept as a list, newest first, and only leave it when the
+// phone says they were dismissed — matching what you see in the phone's own
+// shade rather than the watch quietly forgetting them. The NOTIF screen
+// scrolls through the list; the STAT banner always shows slot 0.
+struct Notif {
+  long id;        // Gadgetbridge's notification id, used to match dismissals
+  String src;     // app name, e.g. "Signal"
+  String title;   // usually the sender
+  String body;    // message text
+};
+static const uint8_t MAX_NOTIFS = 8; // older ones fall off the end
+Notif notifs[MAX_NOTIFS];
+uint8_t notifCount = 0;
+uint8_t notifIndex = 0; // which one the NOTIF screen is currently showing
 
 bool hasWeather = false;
 int weatherTempC = 0;
@@ -286,6 +299,55 @@ class TimeWriteCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// ---------- notification list ----------
+// Adds a notification at slot 0 (newest first). An id already in the list
+// updates in place rather than duplicating — Gadgetbridge re-sends the same
+// id when a notification is updated on the phone, e.g. a chat thread
+// gaining another message.
+void notifAdd(long id, const String &src, const String &title, const String &body) {
+  for (uint8_t i = 0; i < notifCount; i++) {
+    if (id != 0 && notifs[i].id == id) {
+      notifs[i].src = src;
+      notifs[i].title = title;
+      notifs[i].body = body;
+      // Move it to the front so "newest first" still holds after an update.
+      for (uint8_t j = i; j > 0; j--) {
+        Notif tmp = notifs[j - 1];
+        notifs[j - 1] = notifs[j];
+        notifs[j] = tmp;
+      }
+      return;
+    }
+  }
+
+  if (notifCount < MAX_NOTIFS) notifCount++;
+  for (uint8_t j = notifCount - 1; j > 0; j--) notifs[j] = notifs[j - 1]; // shift down, dropping the oldest
+  notifs[0].id = id;
+  notifs[0].src = src;
+  notifs[0].title = title;
+  notifs[0].body = body;
+}
+
+// Removes by id. A dismissal without a usable id falls back to dropping the
+// newest, which is the best guess available and still better than ignoring
+// the message and letting the list grow stale.
+void notifRemove(long id) {
+  if (notifCount == 0) return;
+  uint8_t target = 0;
+  bool found = (id == 0);
+  if (id != 0) {
+    for (uint8_t i = 0; i < notifCount; i++) {
+      if (notifs[i].id == id) { target = i; found = true; break; }
+    }
+  }
+  if (!found) return; // an id we never held — nothing to do
+
+  for (uint8_t i = target; i + 1 < notifCount; i++) notifs[i] = notifs[i + 1];
+  notifCount--;
+  notifs[notifCount] = Notif(); // release the String memory of the vacated slot
+  if (notifIndex >= notifCount) notifIndex = notifCount ? notifCount - 1 : 0;
+}
+
 // Handles one complete line already extracted from the RX stream. Most
 // messages are `GB({...})` JSON, but time sync is a special case:
 // Gadgetbridge sends it as a raw Espruino JS command instead —
@@ -331,27 +393,31 @@ void handleGadgetbridgeLine(const String &line) {
   const char *type = doc["t"] | "";
 
   if (strcmp(type, "notify") == 0) {
-    notifSrc = String((const char *)(doc["src"] | ""));
-    notifTitle = String((const char *)(doc["title"] | ""));
-    notifBody = String((const char *)(doc["body"] | ""));
-    hasNotif = true;
-    Serial.printf("[pipboy] notify: %s / %s\n", notifSrc.c_str(), notifTitle.c_str());
+    long id = doc["id"] | 0L;
+    notifAdd(id,
+             String((const char *)(doc["src"] | "")),
+             String((const char *)(doc["title"] | "")),
+             String((const char *)(doc["body"] | "")));
+    Serial.printf("[pipboy] notify id=%ld: %s / %s (%u held)\n",
+                  id, notifs[0].src.c_str(), notifs[0].title.c_str(), notifCount);
 
-    // Pop the notification screen up for a few seconds, like a real watch.
+    // Pop the notification screen up for a few seconds, like a real watch,
+    // showing the one that just arrived rather than wherever the list was
+    // last scrolled to.
+    notifIndex = 0;
     currentScreen = SCREEN_NOTIF;
     notifAutoShown = true;
     notifAutoRevertMs = millis() + 8000;
     wakeScreen(millis());
 
   } else if (strcmp(type, "notify-") == 0) {
-    // Phone-side dismissal. Without handling this, hasNotif would latch on
-    // forever after the first notification and the STAT banner could never
-    // return to blank. Ids aren't tracked — the watch only ever holds one
-    // notification — so any dismissal clears the one being shown.
-    notifSrc = notifTitle = notifBody = "";
-    hasNotif = false;
+    // Dismissed on the phone. Matching on id is what keeps the watch's list
+    // in step with the phone's shade — dismissing one message must not take
+    // the others with it.
+    long id = doc["id"] | 0L;
+    notifRemove(id);
     forceRedraw = true;
-    Serial.println("[pipboy] notification dismissed on phone.");
+    Serial.printf("[pipboy] notification dismissed on phone: id=%ld (%u left)\n", id, notifCount);
 
   } else if (strcmp(type, "weather") == 0) {
     // Gadgetbridge's Bangle.js weather payload is
@@ -1177,9 +1243,12 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
   // app name and sender, no message body (that's what the NOTIF screen is
   // for). Blank when nothing is pending, so the clock face stays clean.
   useSharpSmallFont();
-  if (hasNotif) {
-    String banner = notifSrc;
-    if (notifTitle.length()) banner += banner.length() ? " - " + notifTitle : notifTitle;
+  if (notifCount) {
+    // Always the newest (slot 0), regardless of where the NOTIF screen is
+    // scrolled to — this line is a "latest activity" indicator, not a view
+    // into the list.
+    String banner = notifs[0].src;
+    if (notifs[0].title.length()) banner += banner.length() ? " - " + notifs[0].title : notifs[0].title;
     if (!banner.length()) banner = "NOTIFICATION"; // neither field supplied
     display.setTextColor(COL_GREEN, COL_BG);
     display.drawString(fitToWidth(banner, 205), 120, 84);
@@ -1353,9 +1422,17 @@ void drawNotifScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpSmallFont();
   display.setTextColor(COL_GREEN_DIM, COL_BG);
-  display.drawString("NOTIFICATION", 120, 46);
+  // Header doubles as the position indicator once more than one is held,
+  // so it's obvious there are others to scroll to.
+  if (notifCount > 1) {
+    char hdr[24];
+    snprintf(hdr, sizeof(hdr), "NOTIFICATION %u/%u", notifIndex + 1, notifCount);
+    display.drawString(hdr, 120, 46);
+  } else {
+    display.drawString("   NOTIFICATION   ", 120, 46);
+  }
 
-  if (!hasNotif) {
+  if (!notifCount) {
     display.setTextColor(COL_GREEN_DIM, COL_BG);
     display.drawString("-- NONE YET --", 120, 120);
     // The setup hint is only useful before there's a phone connected —
@@ -1370,15 +1447,23 @@ void drawNotifScreen(int battPct) {
       display.drawString("                     ", 120, 162);
     }
   } else {
+    const Notif &n = notifs[notifIndex];
     display.setTextColor(COL_GREEN, COL_BG);
-    display.drawString(notifSrc.length() ? notifSrc : "NOTIFICATION", 120, 70);
+    display.drawString(n.src.length() ? n.src : "NOTIFICATION", 120, 70);
 
     useSharpSmallFont();
     display.setTextColor(COL_GREEN, COL_BG);
-    drawWrapped(notifTitle, 92, 190, 16, 2);
+    drawWrapped(n.title, 92, 190, 16, 2);
 
     display.setTextColor(COL_GREEN_DIM, COL_BG);
-    drawWrapped(notifBody, 134, 190, 16, 4);
+    drawWrapped(n.body, 134, 190, 16, 4);
+
+    // Hint that there's more than one, and which way to move through them.
+    if (notifCount > 1) {
+      display.setTextColor(COL_GREEN_DIM, COL_BG);
+      display.drawString(notifIndex > 0 ? "^" : " ", 120, 60);
+      display.drawString(notifIndex + 1 < notifCount ? "v" : " ", 120, 198);
+    }
   }
 
   drawBleBattCluster(battPct);
@@ -1395,22 +1480,48 @@ void drawVaultBoy(int x, int y, uint8_t brightness) {
   display.drawBitmap(x, y, VAULTBOY_BITMAP, VAULTBOY_W, VAULTBOY_H, flickerGreen, COL_BG);
 }
 
-// Small progress bar below the mascot, replacing the old status text.
-// `ok=false` renders it amber instead of green (used for the final state
-// if WiFi/NTP sync failed).
-void drawLoadingBar(int pct, bool ok = true) {
-  const int BW = 120, BH = 8, BORDER = 2;
-  int x = 120 - BW / 2, y = 206;
-  display.fillSmoothRoundRect(x, y, BW, BH, 3, COL_GREEN_DIM);
-  display.fillSmoothRoundRect(x + BORDER, y + BORDER, BW - 2 * BORDER, BH - 2 * BORDER, 1, COL_BG);
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  int fw = (BW - 2 * BORDER) * pct / 100;
-  if (fw > 0) {
-    display.fillRect(x + BORDER, y + BORDER, fw, BH - 2 * BORDER, ok ? COL_GREEN : COL_AMBER);
+// ---------- boot terminal ----------
+// Boot now reads as a scrolling terminal log rather than a static splash:
+// each real step reports itself as it happens, so the screen shows what the
+// watch is genuinely doing (and, when something fails, where it stopped).
+//
+// Lines live in the vertical band where the round panel is widest. At the
+// very top and bottom of a 240px circle the usable width collapses, so text
+// placed there gets physically cut off by the bezel even though it's inside
+// the framebuffer.
+static const uint8_t BOOT_LOG_MAX = 8;
+static const int BOOT_LOG_X = 26, BOOT_LOG_Y0 = 66, BOOT_LOG_LINE_H = 16;
+String bootLines[BOOT_LOG_MAX];
+uint8_t bootLineCount = 0;
+
+void bootLog(const String &msg) {
+  Serial.printf("[pipboy] %s\n", msg.c_str());
+
+  if (bootLineCount == BOOT_LOG_MAX) {
+    for (uint8_t i = 1; i < BOOT_LOG_MAX; i++) bootLines[i - 1] = bootLines[i];
+    bootLineCount--;
   }
+  bootLines[bootLineCount++] = msg;
+
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.setTextDatum(top_left);
+  useSharpSmallFont();
+  for (uint8_t i = 0; i < bootLineCount; i++) {
+    // Older lines fade back, so the eye lands on the newest one — the CRT
+    // equivalent of scrollback falling away.
+    display.setTextColor(i + 1 == bootLineCount ? COL_GREEN : COL_GREEN_DIM, COL_BG);
+    display.drawString(bootLines[i], BOOT_LOG_X, BOOT_LOG_Y0 + i * BOOT_LOG_LINE_H);
+  }
+  display.endWrite();
+  display.setTextDatum(middle_center);
+
+  // Long enough to actually read as it goes by. The whole sequence is under
+  // two seconds, and the slow parts of boot (WiFi, NTP) dwarf it anyway.
+  delay(110);
 }
 
+// Vault Boy still gets his moment, after the log and before the watch face.
 void playBootAnimation() {
   display.fillScreen(COL_BG);
   display.setTextDatum(middle_center);
@@ -1431,9 +1542,7 @@ void playBootAnimation() {
     display.endWrite();
     delay(90);
   }
-  delay(250);
-
-  drawLoadingBar(10);
+  delay(400);
 }
 
 void render(bool fullClear) {
@@ -1493,16 +1602,16 @@ void setup() {
   display.setBrightness(BRIGHT_ACTIVE);
   lastActivityMs = millis();
 
-  // Boot splash drawn immediately, independent of everything else below, so
-  // the panel/SPI path is proven working before we touch I2C at all — but
-  // skip the multi-second flicker-in on a sleep wake, where it'd just be an
-  // annoying delay between "touched the watch" and "screen shows something".
-  if (wokeFromSleep) {
-    display.startWrite();
-    display.fillScreen(COL_BG);
-    display.endWrite();
-  } else {
-    playBootAnimation();
+  // The boot terminal is skipped entirely on a sleep wake — there it would
+  // just be a delay between "touched the watch" and "screen shows
+  // something", which is the opposite of what waking should feel like.
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.endWrite();
+  if (!wokeFromSleep) {
+    bootLog("> PIP-BOY 3000");
+    bootLog("> RobCo Industries");
+    bootLog(dispOk ? "> display....OK" : "> display..FAIL");
   }
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
@@ -1511,23 +1620,25 @@ void setup() {
   Wire.setClock(400000);
   Wire.setTimeOut(50); // ms — never let a stuck bus hang setup()
 
-  Serial.println("[pipboy] scanning I2C bus...");
+  if (!wokeFromSleep) bootLog("> scanning i2c...");
   for (uint8_t addr = 0x08; addr < 0x78; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
       Serial.printf("[pipboy]   found device at 0x%02X\n", addr);
+      if (!wokeFromSleep) {
+        char line[24];
+        snprintf(line, sizeof(line), "  found 0x%02X", addr);
+        bootLog(line);
+      }
     }
   }
-  Serial.println("[pipboy] scan done.");
-  drawLoadingBar(25);
 
-  Serial.println("[pipboy] probing touch...");
   for (int attempt = 1; attempt <= 4 && !touchOk; attempt++) {
     touchOk = touch.begin(Wire, PIN_TOUCH_RST, PIN_TOUCH_INT);
     Serial.printf("[pipboy] touch.begin() attempt %d -> %d\n", attempt, touchOk);
     if (!touchOk) delay(150);
   }
-  drawLoadingBar(35);
+  if (!wokeFromSleep) bootLog(touchOk ? "> touch......OK" : "> touch....FAIL");
 
   Serial.println("[pipboy] probing IMU...");
   imuOk = imu.begin(Wire, QMI8658_ADDRESS_HIGH) || imu.begin(Wire, QMI8658_ADDRESS_LOW);
@@ -1550,12 +1661,11 @@ void setup() {
       imu.setGyroUnit_dps(true);
     }
   }
-  drawLoadingBar(45);
+  if (!wokeFromSleep) bootLog(imuOk ? "> imu........OK" : "> imu......FAIL");
 
   loadState();
-  Serial.println("[pipboy] starting BLE...");
+  if (!wokeFromSleep) bootLog("> bluetooth up");
   setupBLE();
-  drawLoadingBar(60);
 
   bool wifiOk;
   if (wokeFromSleep) {
@@ -1582,38 +1692,25 @@ void setup() {
       Serial.println("[pipboy] wake: recently synced, skipping WiFi.");
     }
   } else {
+    bootLog("> wifi connect...");
     wifiOk = wifiConnectOrSetup();
     rtcLastSyncAttemptEpoch = time(nullptr);
 
     // wifiConnectOrSetup() may have taken over the whole screen for the
-    // setup portal — redraw the boot background underneath the final
-    // loading-bar state so that screen doesn't show through.
-    display.startWrite();
-    display.fillScreen(COL_BG);
-    drawVaultBoy((240 - VAULTBOY_W) / 2, 6, 255);
-    display.endWrite();
-    drawLoadingBar(100, wifiOk);
-  }
+    // setup portal, so the log is re-rendered from scratch by the next
+    // bootLog() rather than assumed to still be on the panel.
+    bootLog(wifiOk ? "> ntp sync...OK" : "> ntp sync.FAIL");
+    bootLog("> READY");
+    delay(350);
 
-  if (!dispOk) {
-    useSharpSmallFont();
-    display.setTextColor(COL_AMBER, COL_BG);
-    display.drawString("DISPLAY INIT FAILED", 120, 222);
-  }
-  if (!touchOk) {
-    useSharpSmallFont();
-    display.setTextColor(COL_AMBER, COL_BG);
-    display.drawString("NO TOUCH", 80, 222);
-  }
-  if (!imuOk) {
-    useSharpSmallFont();
-    display.setTextColor(COL_AMBER, COL_BG);
-    display.drawString("NO IMU", 170, 222);
+    // Vault Boy closes the sequence, after the log and before the watch
+    // face — the terminal says what happened, he says whose watch it is.
+    playBootAnimation();
   }
 
   // Skip the settle delay on a sleep wake — the whole point of that path is
   // getting back to something useful on screen as fast as possible.
-  if (!wokeFromSleep) delay(600);
+  if (!wokeFromSleep) delay(200);
   Serial.println("[pipboy] PIP-BOY 3000 online.");
 }
 
@@ -1720,8 +1817,23 @@ void loop() {
         uint32_t heldMs = now - touchDownStartMs;
         bool heldStill = abs(rawDx) < 15 && abs(rawDy) < 15;
 
+        // The axis perpendicular to the screen-changing swipe is free, so
+        // it scrolls the notification list. Whichever axis moved further
+        // decides which gesture this was, so a slightly diagonal swipe
+        // still does the one it looked most like.
+        int16_t visualScroll = SWIPE_AXIS_IS_RAW_Y ? rawDx : rawDy;
+        if (VSWIPE_INVERT) visualScroll = -visualScroll;
+
         Serial.printf("[pipboy] lift: held=%lums dx=%d dy=%d screen=%u dimWake=%d\n",
                       (unsigned long)heldMs, rawDx, rawDy, currentScreen, touchWasDimWake);
+
+        if (currentScreen == SCREEN_NOTIF && notifCount > 1 && !touchWasDimWake &&
+            abs(visualScroll) >= SWIPE_MIN_DIST && abs(visualScroll) > abs(visualSwipe)) {
+          if (visualScroll > 0 && notifIndex + 1 < notifCount) notifIndex++;
+          else if (visualScroll < 0 && notifIndex > 0) notifIndex--;
+          notifAutoShown = false; // user's driving now, stop the auto-revert timer
+          forceRedraw = true;
+        } else
 
         // A touch that woke the dimmed screen is barred from *navigating*
         // — you shouldn't land on a different screen just for looking at
