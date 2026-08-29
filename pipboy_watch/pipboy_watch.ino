@@ -70,9 +70,13 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 // This board has no physical power switch, and the long-press-and-hold
 // gesture is shared by two different actions depending which screen it's
 // done on — see the long-press handling in loop().
-static const uint32_t LONG_PRESS_MS = 3000;      // hold at least this long, finger still, then release
-static const uint32_t LONG_PRESS_MAX_MS = 12000; // ...but not longer than this, so something resting on
-                                                 // the screen and later removed doesn't count as a press
+// Which action fires is chosen by how long the hold lasted, not by which
+// screen you were on — screen-dependent actions proved unpredictable, since
+// waking from deep sleep reboots and lands back on STAT.
+static const uint32_t LONG_PRESS_MS = 3000;       // hold at least this long, finger still, then release
+static const uint32_t SLEEP_PRESS_MAX_MS = 6000;  // 3-6s puts it to sleep; beyond that is the portal
+static const uint32_t LONG_PRESS_MAX_MS = 12000;  // ...and past this nothing fires, so something resting on
+                                                  // the screen and later removed doesn't count as a press
 // POSIX TZ string for America/Toronto — handles EST/EDT DST automatically.
 static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
 // Tracked in seconds of real wall-clock time (not millis()) because millis()
@@ -751,8 +755,24 @@ void setupPowerManagement() {
 // state loses power, so the only way back is through setup() again from the
 // top. See the wake-from-sleep fast path near the top of setup().
 void enterDeepSleep() {
-  Serial.println("[pipboy] long-press on DATA screen -> entering deep sleep...");
+  Serial.println("[pipboy] long-press -> entering deep sleep...");
   saveState(); // catch any steps counted since the last periodic save
+
+  // Say so on screen before going dark. Without this, sleeping looks
+  // identical to a crash or a reboot — and since waking is a full restart,
+  // there's otherwise nothing to distinguish "it slept and woke" from "it
+  // never slept at all".
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.setTextDatum(middle_center);
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString("SLEEP", 120, 112);
+  useSharpSmallFont();
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("touch to wake", 120, 142);
+  display.endWrite();
+  delay(900);
 
   display.startWrite();
   display.fillScreen(COL_BG);
@@ -1667,23 +1687,27 @@ void loop() {
           forceRedraw = true;
 
         } else if (heldStill && heldMs >= LONG_PRESS_MS && heldMs <= LONG_PRESS_MAX_MS) {
-          // Long-press actions fire on *release*, not while still held, and
-          // only for a hold inside a sane duration window. Firing mid-hold
-          // meant anything resting against the screen — the watch set face
-          // down, a sleeve, a cable pressing on it — sailed past the 3s
-          // threshold and silently opened the WiFi portal (observed doing
-          // exactly that in a serial log, which also knocks Gadgetbridge
-          // offline for as long as the portal is up). A resting object
-          // never lifts, so release-triggering can't be fooled by one; the
-          // upper bound covers the case where it's eventually removed.
-          //   STAT (0) -> reopen the WiFi setup portal
-          //   DATA (1) -> deep sleep (this board's only "power button")
-          // Every other screen: long-press does nothing.
+          // Duration, not screen, selects the action. Keying them off which
+          // screen you were on made this unpredictable in practice: waking
+          // from deep sleep is a full reboot, which lands you back on STAT,
+          // so the natural "hold again to sleep again" landed on the portal
+          // instead and looked like sleep was broken.
+          //   ~3-6s  -> deep sleep (this board's only "power button")
+          //   ~6-12s -> reopen the WiFi setup portal
+          // Long-press actions fire on *release*, not while still held.
+          // Firing mid-hold meant anything resting against the screen — the
+          // watch set face down, a sleeve, a cable pressing on it — sailed
+          // past the threshold and silently opened the WiFi portal
+          // (observed doing exactly that in a serial log, which also knocks
+          // Gadgetbridge offline for as long as the portal is up). A
+          // resting object never lifts, so release-triggering can't be
+          // fooled by one; the upper bound covers it eventually being
+          // removed.
           Serial.printf("[pipboy] long-press released after %lums on screen %u\n",
                         (unsigned long)heldMs, currentScreen);
-          if (currentScreen == 1) {
+          if (heldMs < SLEEP_PRESS_MAX_MS) {
             enterDeepSleep(); // never returns — next code that runs is setup()
-          } else if (currentScreen == 0) {
+          } else {
             forceWifiSetupPortal();
             // Minutes may have passed inside that blocking call — the touch
             // chip's idea of "finger down" is stale, so start clean rather
