@@ -3,10 +3,12 @@
 // - Round GC9A01 display, green-phosphor CRT look, four screens (tap to
 //   cycle): STAT (clock + weather one-liner), DATA (steps), WEATHER (full
 //   temp/hi-lo/condition), NOTIF (latest phone notification).
-// - Step counting from the onboard QMI8658 accelerometer. The IMU's gyro
-//   is left disabled (see GYRO_ENABLED) — nothing consumes it yet, and a
-//   running-but-unused gyro is pure current draw for no benefit. Flip that
-//   one flag when a gesture/orientation feature actually needs it.
+// - Step counting from the onboard QMI8658 accelerometer. The gyro
+//   (GYRO_ENABLED) is on too, feeding raise-to-wake: turning the wrist to
+//   look at the watch un-dims the screen without a touch, the same way a
+//   real smartwatch does. See updateRaiseToWake() — its thresholds are
+//   reasoned guesses pending calibration against real hardware, the same
+//   situation the swipe-axis knobs below started in.
 // - No physical power switch on this board — long-press-and-hold (3s,
 //   finger still) on the DATA screen puts it into a real ESP32 deep sleep
 //   instead, waking back up on the next touch. See enterDeepSleep() and the
@@ -80,10 +82,31 @@ static const uint8_t BRIGHT_ACTIVE = 180;
 static const uint8_t BRIGHT_DIM = 12;
 static const uint32_t IDLE_DIM_TIMEOUT_MS = 8000; // dim backlight after 8s of no touch
 // Gyros draw meaningfully more current than accel-only mode on this class of
-// IMU — not worth paying for while gyroX/Y/Z has no consumer. Flip to true
-// (and un-comment the two blocks it gates, in setup() and loop()) the day a
-// gesture/orientation feature actually reads it.
-static const bool GYRO_ENABLED = false;
+// IMU — not worth paying for while nothing reads it. On (costs the extra
+// current) because raise-to-wake, below, is the thing that reads it now.
+static const bool GYRO_ENABLED = true;
+
+// ---------- raise-to-wake (gyro) ----------
+// Same situation as the swipe-axis knobs just below: this board's QMI8658
+// mounting orientation relative to "screen facing you when you look at your
+// wrist" hasn't been verified against real hardware, so these are
+// reasoned-guess defaults, not measured ones. If it never triggers (or
+// triggers on the wrong motion, e.g. every arm swing while walking), the
+// fix is the same kind of one-time calibration as the swipe knobs: log
+// gx/gy/gz and ax/ay/az to Serial, deliberately raise the wrist to look at
+// the watch a few times, and adjust the values below to match what's
+// actually observed.
+static const float RAISE_GYRO_THRESHOLD_DPS = 150.0f; // rotation speed that counts as "an active wrist turn", not ambient jitter
+static const uint32_t RAISE_GYRO_MIN_MS = 80;          // must sustain that rotation at least this long — filters brief spikes/knocks
+static const uint32_t RAISE_GYRO_MAX_MS = 700;         // ...but a real raise is a quick flick, not a slow drift — cap it too
+// Gravity vector (m/s^2) the accelerometer should read once the watch has
+// settled face-up toward you. Default guess: Z points straight out of the
+// screen, so looking at the watch aligns Z with gravity and X/Y with ~0.
+static const float RAISE_ACCEL_TARGET_X = 0.0f;
+static const float RAISE_ACCEL_TARGET_Y = 0.0f;
+static const float RAISE_ACCEL_TARGET_Z = 9.8f;
+static const float RAISE_ACCEL_DOT_MIN = 0.85f; // cosine similarity to the target above; 1.0 = exact match, lower = more lenient
+static const uint32_t RAISE_COOLDOWN_MS = 1500; // minimum gap between two raise-to-wake triggers
 
 // ---------- swipe navigation ----------
 // The display is rotated 90° in software (see setRotation(1) in setup()),
@@ -170,6 +193,11 @@ uint32_t lastActivityMs = 0;
 bool backlightDimmed = false;
 uint32_t lastDayMarker = 0; // epoch-day steps were last reset on
 int lastRenderedSecond = -1;
+
+// ---------- raise-to-wake state ----------
+bool raiseGyroActive = false;   // currently inside a rotation burst above RAISE_GYRO_THRESHOLD_DPS
+uint32_t raiseGyroStartMs = 0;  // when the current burst began
+uint32_t lastRaiseWakeMs = 0;   // last time raise-to-wake actually fired, for RAISE_COOLDOWN_MS
 
 // ---------- BLE ----------
 // Custom "Pip-Boy Time Service". The companion web page writes 4 bytes
@@ -265,10 +293,7 @@ void handleGadgetbridgeLine(const String &line) {
     currentScreen = SCREEN_NOTIF;
     notifAutoShown = true;
     notifAutoRevertMs = millis() + 8000;
-    display.setBrightness(BRIGHT_ACTIVE);
-    backlightDimmed = false;
-    lastActivityMs = millis();
-    forceRedraw = true;
+    wakeScreen(millis());
 
   } else if (strcmp(type, "weather") == 0) {
     float kelvin = doc["temp"] | 0.0f;
@@ -601,6 +626,61 @@ void enterDeepSleep() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOUCH_INT, 0);
   esp_deep_sleep_start();
   // Never reaches here — the reset vector (setup()) is the only way out.
+}
+
+// Un-dims the backlight and marks the screen for a redraw — shared by every
+// wake path (touch, an incoming notification, and now raise-to-wake) so
+// they can't drift out of sync with each other. Also clears the raise-to-
+// wake burst tracker: if some *other* wake path fires mid-burst, that
+// burst's context (how long it's been rotating) is now stale and shouldn't
+// resolve later against a screen state that's already changed.
+void wakeScreen(uint32_t now) {
+  display.setBrightness(BRIGHT_ACTIVE);
+  backlightDimmed = false;
+  forceRedraw = true;
+  lastActivityMs = now;
+  raiseGyroActive = false;
+}
+
+// Detects "raised the wrist to look at the watch" from the gyro+accel and
+// wakes the screen the same way a touch would. Two-part heuristic: (1) a
+// burst of rotation fast enough, and brief enough, to look like a
+// deliberate wrist-turn rather than ambient jitter or a slow drift: then
+// (2) once that burst ends, check whether the accelerometer settled into
+// roughly the orientation you'd expect if the screen is now facing you.
+// Requiring both cuts down on false wakes that either alone would miss —
+// e.g. gyro motion alone would also fire on any fast wrist movement that
+// never actually ends with the watch face up (swinging your arm while
+// walking); the accel orientation alone can't tell a deliberate raise from
+// just holding your arm still in that position.
+//
+// Only meaningful (and only called) while dimmed — there's nothing to wake
+// if the screen's already on.
+void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now) {
+  float gyroMag = sqrtf(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ);
+  bool fastNow = gyroMag > RAISE_GYRO_THRESHOLD_DPS;
+
+  if (fastNow && !raiseGyroActive) {
+    raiseGyroActive = true;
+    raiseGyroStartMs = now;
+  } else if (!fastNow && raiseGyroActive) {
+    uint32_t heldMs = now - raiseGyroStartMs;
+    raiseGyroActive = false;
+
+    bool durationLooksRight = heldMs >= RAISE_GYRO_MIN_MS && heldMs <= RAISE_GYRO_MAX_MS;
+    bool offCooldown = now - lastRaiseWakeMs > RAISE_COOLDOWN_MS;
+    if (durationLooksRight && offCooldown && accelOk) {
+      float amag = sqrtf(ax * ax + ay * ay + az * az);
+      if (amag > 0.1f) { // guard the divide below against a bogus all-zero reading
+        float dot = (ax * RAISE_ACCEL_TARGET_X + ay * RAISE_ACCEL_TARGET_Y + az * RAISE_ACCEL_TARGET_Z) / (amag * 9.8f);
+        if (dot > RAISE_ACCEL_DOT_MIN) {
+          wakeScreen(now);
+          lastRaiseWakeMs = now;
+          Serial.println("[pipboy] raise-to-wake triggered.");
+        }
+      }
+    }
+  }
 }
 
 // ---------- drawing helpers ----------
@@ -1074,14 +1154,22 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // Poll the IMU at ~50Hz and feed the pedometer.
+  // Poll the IMU at ~50Hz and feed the pedometer (and, while dimmed,
+  // raise-to-wake).
   if (imuOk && now - lastImuPollMs >= 20) {
     lastImuPollMs = now;
     float ax, ay, az;
-    if (imu.readAccelMPS2(ax, ay, az)) {
+    bool accelOk = imu.readAccelMPS2(ax, ay, az);
+    if (accelOk) {
       stepCounter.update(ax, ay, az);
     }
-    if (GYRO_ENABLED) imu.readGyro(gyroX, gyroY, gyroZ); // dps, per setGyroUnit_dps() above
+    if (GYRO_ENABLED) {
+      imu.readGyro(gyroX, gyroY, gyroZ); // dps, per setGyroUnit_dps() above
+      // Only worth checking while there's actually something to wake —
+      // skips the extra math the rest of the time, and sidesteps the whole
+      // "what if a burst spans a wake that happened some other way" question.
+      if (backlightDimmed) updateRaiseToWake(accelOk, ax, ay, az, now);
+    }
   }
 
   // Day rollover: once we know real wall-clock time, reset the step
@@ -1119,11 +1207,9 @@ void loop() {
       touchDownStartMs = now;
       longPressConsumed = false;
       if (backlightDimmed) {
-        display.setBrightness(BRIGHT_ACTIVE);
-        backlightDimmed = false;
-        forceRedraw = true;
+        wakeScreen(now);
       }
-      lastActivityMs = now;
+      lastActivityMs = now; // reset the idle timer on every touch, dimmed or not
     } else if (stableDown && prevTouchDown) {
       // Gesture in progress — track the latest position for when it ends.
       touchLastX = tx;
