@@ -296,10 +296,18 @@ void handleGadgetbridgeLine(const String &line) {
     wakeScreen(millis());
 
   } else if (strcmp(type, "weather") == 0) {
-    float kelvin = doc["temp"] | 0.0f;
-    weatherTempC = (int)roundf(kelvin - 273.15f);
-    weatherHiC = (int)roundf((float)(doc["hi"] | kelvin) - 273.15f);
-    weatherLoC = (int)roundf((float)(doc["lo"] | kelvin) - 273.15f);
+    // Gadgetbridge's Bangle.js weather payload is
+    //   {t:"weather", temp, hi, lo, hum, rain, uv, code, txt, wind, wdir, loc}
+    // with temperatures in Kelvin (it carries OpenWeatherMap-style values
+    // through unchanged). toC() tolerates a provider that sends Celsius
+    // instead: no real ambient temperature reaches 200, so a value above
+    // that is unambiguously Kelvin. Cheap insurance against a screen full
+    // of numbers like "-273C" if some future provider differs.
+    auto toC = [](float v) { return (int)roundf(v > 200.0f ? v - 273.15f : v); };
+    float rawTemp = doc["temp"] | 0.0f;
+    weatherTempC = toC(rawTemp);
+    weatherHiC = toC(doc["hi"] | rawTemp);
+    weatherLoC = toC(doc["lo"] | rawTemp);
     weatherTxt = String((const char *)(doc["txt"] | ""));
     hasWeather = true;
     forceRedraw = true;
@@ -416,6 +424,14 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(); // ESP-IDF replays the last SSID/pass it persisted to NVS
 
+  // NOTE on every WiFi.disconnect(wifioff, eraseap) call in this file:
+  // the second argument MUST stay false. eraseap=true zeroes the stored
+  // STA config in NVS — i.e. it deletes the very credentials WiFiManager
+  // just saved. That was harmless back when the SSID/pass were hardcoded
+  // constants, but with WiFiManager owning them it means "forget my WiFi
+  // on every successful sync", which sends the watch back to the setup
+  // portal on the next boot, every time.
+
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
     delay(200);
@@ -423,7 +439,7 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[pipboy] WiFi connect failed/timed out.");
-    WiFi.disconnect(true, true);
+    WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     return false;
   }
@@ -431,7 +447,7 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
   Serial.println("[pipboy] WiFi connected, fetching NTP time...");
   bool gotTime = fetchNtpTime(8000);
 
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF); // save power — we don't need WiFi between syncs
 
   if (gotTime) {
@@ -498,7 +514,7 @@ bool wifiConnectOrSetup() {
 
   Serial.println("[pipboy] WiFi connected, fetching NTP time...");
   bool gotTime = fetchNtpTime(8000);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   if (gotTime) {
     timeSynced = true;
@@ -530,7 +546,7 @@ bool forceWifiSetupPortal() {
   if (connected) {
     Serial.println("[pipboy] WiFi connected, fetching NTP time...");
     gotTime = fetchNtpTime(8000);
-    WiFi.disconnect(true, true);
+    WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     if (gotTime) {
       timeSynced = true;
@@ -855,8 +871,14 @@ void drawWeatherScreen(int battPct) {
     display.setTextColor(COL_GREEN_DIM, COL_BG);
     display.drawString("-- NO DATA --", 120, 120);
     useSharpSmallFont();
-    display.drawString("pair Gadgetbridge to", 120, 148);
-    display.drawString("enable weather sync", 120, 168);
+    // Gadgetbridge has no weather source of its own — it only relays what
+    // a companion weather app (Breezy Weather, Tiny Weather Forecast
+    // Germany, QuickWeather) broadcasts to it, so pairing alone never
+    // produces weather. Say that, rather than implying the pairing is the
+    // missing piece.
+    display.drawString("needs a weather app", 120, 148);
+    display.drawString("feeding Gadgetbridge", 120, 168);
+    display.drawString("e.g. Breezy Weather", 120, 188);
   } else {
     char tempbuf[12];
     snprintf(tempbuf, sizeof(tempbuf), "%dC", weatherTempC);
