@@ -294,6 +294,12 @@ class NUSRxCallbacks : public BLECharacteristicCallbacks {
 void setupBLE() {
   BLEDevice::init("Bangle.js Pip-Boy 3000"); // name must match Gadgetbridge's device-name allowlist
 
+  // Default BLE TX power is +3dBm — plenty of range for a device that's
+  // worn on the wrist next to a phone in the same pocket/room. 0dBm still
+  // covers well beyond that with margin, for meaningfully less radio
+  // current on every advertising/connection event.
+  BLEDevice::setPower(ESP_PWR_LVL_N0);
+
   // Bondable/pairable with no PIN prompt ("Just Works") — lets the watch
   // show up and pair normally from Android's Bluetooth settings.
   BLESecurity *security = new BLESecurity();
@@ -331,6 +337,14 @@ void setupBLE() {
   bleAdvertising->addServiceUUID(SERVICE_UUID);
   bleAdvertising->addServiceUUID(NUS_SERVICE_UUID);
   bleAdvertising->setScanResponse(true);
+  // Default advertising interval is a fast 20-40ms — the radio keys up
+  // 25-50x/second the whole time the watch is unconnected. Slowed to
+  // 100-200ms: still reconnects well under half a second (imperceptible
+  // for a background BLE reconnect), for a fraction of the radio-on time
+  // during any stretch spent disconnected (phone out of range, Bluetooth
+  // off, etc.).
+  bleAdvertising->setMinInterval(160); // 160 * 0.625ms = 100ms
+  bleAdvertising->setMaxInterval(320); // 320 * 0.625ms = 200ms
   bleAdvertising->start();
 }
 
@@ -478,12 +492,23 @@ bool forceWifiSetupPortal() {
 }
 
 // ---------- battery ----------
+// Called from every render() — up to once/second while a screen's active —
+// but a battery percentage doesn't need better than ~30s resolution, and
+// each ADC read has its own small power/time cost. Cached and throttled
+// internally so every call site benefits without needing to know about it.
 int readBatteryPercent() {
-  int mv = analogReadMilliVolts(PIN_BATT_ADC) * 3; // 200k/100k divider
-  float pct = (mv - 3300) / (4200.0f - 3300.0f) * 100.0f; // rough LiPo curve
-  if (pct < 0) pct = 0;
-  if (pct > 100) pct = 100;
-  return (int)(pct + 0.5f);
+  static int cachedPct = -1;
+  static uint32_t lastReadMs = 0;
+  uint32_t now = millis();
+  if (cachedPct < 0 || now - lastReadMs > 30000) {
+    int mv = analogReadMilliVolts(PIN_BATT_ADC) * 3; // 200k/100k divider
+    float pct = (mv - 3300) / (4200.0f - 3300.0f) * 100.0f; // rough LiPo curve
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    cachedPct = (int)(pct + 0.5f);
+    lastReadMs = now;
+  }
+  return cachedPct;
 }
 
 // ---------- persistence ----------
@@ -495,10 +520,22 @@ void loadState() {
 }
 
 void saveState() {
+  // Flash writes cost real current (and wear) — skip the NVS commit
+  // entirely on the common case of "nothing changed since last save"
+  // (e.g. sitting still between steps). Doesn't change the save
+  // guarantee at all: still checked/written every 30s the instant
+  // something *does* change, same window as before.
+  static uint32_t lastSavedSteps = UINT32_MAX;
+  static uint32_t lastSavedDayMarker = UINT32_MAX;
+  uint32_t steps = stepCounter.count();
+  if (steps == lastSavedSteps && lastDayMarker == lastSavedDayMarker) return;
+
   prefs.begin("pipboy", false);
-  prefs.putUInt("steps", stepCounter.count());
+  prefs.putUInt("steps", steps);
   prefs.putUInt("dayMarker", lastDayMarker);
   prefs.end();
+  lastSavedSteps = steps;
+  lastSavedDayMarker = lastDayMarker;
 }
 
 // ---------- power ----------
@@ -1122,11 +1159,16 @@ void loop() {
   }
 
   // A clock only needs to redraw when the second (or screen/state) changes —
-  // keeps things flicker-free without needing a second framebuffer.
+  // keeps things flicker-free without needing a second framebuffer. And
+  // skip it entirely while the backlight is dimmed to near-invisible: a
+  // redraw nobody can see burns CPU/SPI time for zero benefit, ~86,400
+  // times a day whenever the watch sits idle. Nothing is lost by
+  // deferring — waking always sets forceRedraw=true, so the very next
+  // frame after a touch is already guaranteed correct.
   time_t nowSec = time(nullptr);
   struct tm t;
   localtime_r(&nowSec, &t);
-  if (forceRedraw || t.tm_sec != lastRenderedSecond) {
+  if (!backlightDimmed && (forceRedraw || t.tm_sec != lastRenderedSecond)) {
     render(forceRedraw);
     lastRenderedSecond = t.tm_sec;
     forceRedraw = false;
