@@ -73,6 +73,8 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 // Which action fires is chosen by how long the hold lasted, not by which
 // screen you were on — screen-dependent actions proved unpredictable, since
 // waking from deep sleep reboots and lands back on STAT.
+static const uint32_t TAP_MAX_MS = 600;          // a press shorter than this, held still, counts as a tap
+static const uint32_t STEPS_RESET_ARM_MS = 4000; // window to confirm a step reset with a second tap
 static const uint32_t LONG_PRESS_MS = 3000;       // hold at least this long, finger still, then release
 static const uint32_t SLEEP_PRESS_MAX_MS = 6000;  // 3-6s puts it to sleep; beyond that is the portal
 static const uint32_t LONG_PRESS_MAX_MS = 12000;  // ...and past this nothing fires, so something resting on
@@ -174,10 +176,36 @@ bool imuOk = false;
 
 volatile bool bleConnected = false;
 volatile bool timeSynced = false;
-uint8_t currentScreen = 0; // 0 = STAT (clock), 1 = DATA (steps), 2 = WEATHER, 3 = NOTIF
-const uint8_t NUM_SCREENS = 4;
-const uint8_t SCREEN_WEATHER = 2;
-const uint8_t SCREEN_NOTIF = 3;
+uint8_t currentScreen = 0; // see the SCREEN_* slots below
+const uint8_t SCREEN_STAT = 0;      // clock, date, weather line, notification banner
+const uint8_t SCREEN_DATA = 1;      // step count
+const uint8_t SCREEN_WEATHER = 2;   // full weather
+const uint8_t SCREEN_NOTIF = 3;     // notification list
+const uint8_t SCREEN_STOPWATCH = 4;
+const uint8_t SCREEN_TIMER = 5;
+const uint8_t NUM_SCREENS = 6;
+
+// ---------- stopwatch ----------
+// Both the stopwatch and the timer keep running while you're on other
+// screens; they're only *displayed* by their own screens. Elapsed time is
+// derived from millis() rather than counted up in the loop, so it can't
+// drift with however often the loop happens to run.
+bool swRunning = false;
+uint32_t swStartMs = 0;   // millis() at the last start
+uint32_t swAccumMs = 0;   // time banked by previous start/stop cycles
+
+// ---------- countdown timer ----------
+// Presets rather than a digit-entry UI — there's one finger and a 240px
+// circle to work with, and picking from a short list is far quicker than
+// setting a duration a digit at a time.
+const uint32_t TIMER_PRESETS_SEC[] = {60, 180, 300, 600, 900, 1800, 3600};
+const uint8_t TIMER_PRESET_COUNT = sizeof(TIMER_PRESETS_SEC) / sizeof(TIMER_PRESETS_SEC[0]);
+uint8_t timerPresetIdx = 2; // 5 minutes
+bool timerRunning = false;
+uint32_t timerEndMs = 0;      // millis() the countdown reaches zero at
+uint32_t timerRemainMs = 0;   // frozen remainder while paused
+bool timerFired = false;      // expired and still asking to be acknowledged
+uint32_t timerFiredMs = 0;
 bool prevTouchDown = false;   // debounced/stable state used for edge detection
 uint8_t touchDownStreak = 0;  // consecutive raw "down" reads in a row
 bool wakeTouchPending = false; // a touch woke the dimmed screen; suppress navigation until it lifts
@@ -239,6 +267,8 @@ float gyroX = 0, gyroY = 0, gyroZ = 0;
 
 uint32_t lastImuPollMs = 0;
 uint32_t lastImuTraceMs = 0;
+uint32_t lastFastDrawMs = 0;
+uint32_t stepsResetArmedMs = 0; // non-zero while a step reset is waiting for its confirming tap
 uint32_t lastSaveMs = 0;
 // RTC_DATA_ATTR survives deep sleep (backed by RTC slow memory, unlike
 // regular globals which reset every wake) but not a full power cycle — that
@@ -956,6 +986,10 @@ void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now)
 // risk of a leftover scale from one screen leaking into another.
 void useSharpSmallFont() { display.setFont(&fonts::FreeMonoBold9pt7b); display.setTextSize(0.75f); }
 void useSharpMedFont()   { display.setFont(&fonts::FreeMonoBold12pt7b); display.setTextSize(1.0f); }
+// A step up from the small face for the STAT screen's date/weather rows,
+// but held just under full medium: at 1.0 a full-width date overruns the
+// round panel, and these rows sit where the circle is already narrowing.
+void useSharpRowFont()   { display.setFont(&fonts::FreeMonoBold12pt7b); display.setTextSize(0.85f); }
 
 // Trims a string until it fits maxW pixels in the *currently set* font,
 // marking the cut with "..." — the FreeMono faces have no ellipsis glyph.
@@ -1218,17 +1252,22 @@ void drawWeatherIcon(int x, int y, int s, WeatherIcon icon, uint16_t col) {
 
 // Small one-line "23°C  clear sky" row, centered on cx. Same three-piece
 // trick as the big temperature, at the small text size.
-void drawSmallTempRow(int cx, int cy, int tempC, const String &desc, uint16_t col) {
-  useSharpSmallFont();
+void drawTempRow(int cx, int cy, int tempC, const String &desc, uint16_t col) {
+  useSharpRowFont();
   char numbuf[8];
   snprintf(numbuf, sizeof(numbuf), "%d", tempC);
-  String tail = desc.length() ? ("  " + desc) : "";
 
   int numW = display.textWidth(numbuf);
   int cW = display.textWidth("C");
-  int tailW = tail.length() ? display.textWidth(tail) : 0;
+  const int GAP = 3, RING_R = 3, RING_GAP = 2;
 
-  const int GAP = 3, RING_R = 2, RING_GAP = 2;
+  // Trim the condition to whatever room is left after the temperature. At
+  // this larger size a long one ("partly cloudy") would otherwise run off
+  // both edges of the round panel.
+  const int ROW_MAX_W = 200;
+  int fixedW = numW + GAP + RING_R * 2 + RING_GAP + cW;
+  String tail = desc.length() ? fitToWidth("  " + desc, ROW_MAX_W - fixedW) : "";
+  int tailW = tail.length() ? display.textWidth(tail) : 0;
   int totalW = numW + GAP + RING_R * 2 + RING_GAP + cW + tailW;
   int x = cx - totalW / 2;
 
@@ -1281,27 +1320,33 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
   display.setTextSize(1.0f);
 
   // Everything below uses a sharp bold monospace face instead of Font7
-  // (the time's font is 7-segment-style and can't render letters at all).
-  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  // (the time's font is 7-segment-style and can't render letters at all),
+  // at full green rather than the dim shade — these were noticeably harder
+  // to read than the clock above them.
+  display.setTextColor(COL_GREEN, COL_BG);
 
   char datebuf[32];
   static const char *wd[7] = {"Sun.","Mon.","Tue.","Wed.","Thu.","Fri.","Sat."};
-  static const char *mo[12] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+  // Abbreviated deliberately: at this larger size the full month name runs
+  // past the usable width of a round 240px panel ("Wed. September 30, 2026"
+  // needs ~270px against ~220 available at this height).
+  static const char *mo[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
   if (timeSynced) {
     snprintf(datebuf, sizeof(datebuf), "%s %s %d, %d", wd[t.tm_wday], mo[t.tm_mon], t.tm_mday, t.tm_year + 1900);
   } else {
     snprintf(datebuf, sizeof(datebuf), "-- NO SIGNAL --");
   }
-  useSharpSmallFont();
-  display.drawString(datebuf, 120, 168);
+  useSharpRowFont();
+  display.drawString(datebuf, 120, 164);
 
   // Current temperature + condition only — the high/low pair lives on the
   // dedicated WEATHER screen, where there's room to label it properly.
   if (hasWeather && !weatherTooStale()) {
-    drawSmallTempRow(120, 192, weatherTempC, weatherTxt, COL_GREEN_DIM);
+    drawTempRow(120, 190, weatherTempC, weatherTxt, COL_GREEN);
   } else {
     // Blank the row so a stale reading can't linger between redraws.
-    display.drawString("                    ", 120, 192);
+    useSharpRowFont();
+    display.drawString("                    ", 120, 190);
   }
 
   drawBleBattCluster(battPct);
@@ -1320,12 +1365,25 @@ void drawDataScreen(int steps, int battPct) {
   display.setFont(&fonts::Font7);
   display.drawString(stepbuf, 120, 120);
 
+  // Reset affordance / confirmation prompt, in place of the distance line
+  // while armed so nothing has to shuffle position.
+  if (stepsResetArmedMs && millis() - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
+    useSharpSmallFont();
+    display.setTextColor(COL_AMBER, COL_BG);
+    display.drawString(" TAP AGAIN TO RESET ", 120, 168);
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString("                    ", 120, 188);
+    drawBleBattCluster(battPct);
+    return;
+  }
+
   float km = steps * 0.00075f; // ~0.75m average stride
   char distbuf[24];
   snprintf(distbuf, sizeof(distbuf), "~%.2f KM", km);
   useSharpSmallFont();
   display.setTextColor(COL_GREEN_DIM, COL_BG);
   display.drawString(distbuf, 120, 168);
+  display.drawString("   tap to reset   ", 120, 188);
 
   drawBleBattCluster(battPct);
 }
@@ -1424,6 +1482,87 @@ void drawWrapped(const String &text, int y, int maxWidth, int lineHeight, int ma
   if (lineNum < maxLines && line.length()) {
     display.drawString(line, 120, y + lineNum * lineHeight);
   }
+}
+
+// ---------- stopwatch / timer ----------
+uint32_t stopwatchElapsedMs() {
+  return swAccumMs + (swRunning ? (millis() - swStartMs) : 0);
+}
+
+uint32_t timerRemainingMs() {
+  if (!timerRunning) return timerRemainMs;
+  uint32_t now = millis();
+  return (now >= timerEndMs) ? 0 : (timerEndMs - now);
+}
+
+void timerLoad(uint8_t presetIdx) {
+  timerPresetIdx = presetIdx % TIMER_PRESET_COUNT;
+  timerRemainMs = TIMER_PRESETS_SEC[timerPresetIdx] * 1000UL;
+  timerRunning = false;
+  timerFired = false;
+}
+
+void drawStopwatchScreen(int battPct) {
+  display.setTextDatum(middle_center);
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("Stopwatch", 120, 66);
+
+  uint32_t ms = stopwatchElapsedMs();
+  // Font7 has no letters but does carry digits, ':' and '.', which is
+  // exactly what a stopwatch readout needs — so it gets the same
+  // seven-segment treatment as the clock.
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%lu:%02lu.%lu",
+           (unsigned long)(ms / 60000UL),
+           (unsigned long)((ms / 1000UL) % 60UL),
+           (unsigned long)((ms / 100UL) % 10UL));
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.setFont(&fonts::Font7);
+  display.setTextSize(0.75f);
+  display.drawString(buf, 120, 118);
+  display.setTextSize(1.0f);
+
+  useSharpSmallFont();
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString(swRunning ? " tap to stop " : " tap to start ", 120, 162);
+  display.drawString(swRunning || stopwatchElapsedMs() == 0 ? "             " : " swipe to clear ", 120, 182);
+
+  drawBleBattCluster(battPct);
+}
+
+void drawTimerScreen(int battPct) {
+  display.setTextDatum(middle_center);
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN_DIM, COL_BG);
+  display.drawString("Timer", 120, 66);
+
+  uint32_t ms = timerRemainingMs();
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%lu:%02lu",
+           (unsigned long)(ms / 60000UL), (unsigned long)((ms / 1000UL) % 60UL));
+
+  // Amber once it has expired — the one state that wants to be noticed
+  // from across a room, and the palette already reserves amber for that.
+  display.setTextColor(timerFired ? COL_AMBER : COL_GREEN, COL_BG);
+  display.setFont(&fonts::Font7);
+  display.setTextSize(0.85f);
+  display.drawString(buf, 120, 118);
+  display.setTextSize(1.0f);
+
+  useSharpSmallFont();
+  if (timerFired) {
+    display.setTextColor(COL_AMBER, COL_BG);
+    display.drawString("  -- TIME UP --  ", 120, 162);
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString("  tap to reset   ", 120, 182);
+  } else {
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString(timerRunning ? "  tap to pause  " : "  tap to start  ", 120, 162);
+    display.drawString(timerRunning ? "                " : " swipe: set time ", 120, 182);
+  }
+
+  drawBleBattCluster(battPct);
 }
 
 void drawNotifScreen(int battPct) {
@@ -1565,10 +1704,12 @@ void render(bool fullClear) {
   int steps = stepCounter.count();
   int battPct = readBatteryPercent();
 
-  if (currentScreen == 0) drawStatScreen(t, steps, battPct);
-  else if (currentScreen == 1) drawDataScreen(steps, battPct);
+  if (currentScreen == SCREEN_STAT) drawStatScreen(t, steps, battPct);
+  else if (currentScreen == SCREEN_DATA) drawDataScreen(steps, battPct);
   else if (currentScreen == SCREEN_WEATHER) drawWeatherScreen(battPct);
-  else drawNotifScreen(battPct);
+  else if (currentScreen == SCREEN_NOTIF) drawNotifScreen(battPct);
+  else if (currentScreen == SCREEN_STOPWATCH) drawStopwatchScreen(battPct);
+  else drawTimerScreen(battPct);
   display.endWrite();
 }
 
@@ -1672,6 +1813,7 @@ void setup() {
   if (!wokeFromSleep) bootLog(imuOk ? "> imu........OK" : "> imu......FAIL");
 
   loadState();
+  timerLoad(timerPresetIdx); // arm the default duration so the screen has something to show
   if (!wokeFromSleep) bootLog("> bluetooth up");
   setupBLE();
 
@@ -1754,12 +1896,25 @@ void loop() {
     }
   }
 
-  // Day rollover: once we know real wall-clock time, reset the step
-  // count the first time we notice the calendar day has changed.
+  // Day rollover: once we know real wall-clock time, reset the step count
+  // the first time we notice the calendar day has changed. Checked every
+  // pass, so a watch booting into a new day resets as soon as its clock is
+  // valid, not only if it happened to be awake at midnight.
+  //
+  // The marker is a local YYYYMMDD, not the old time()/86400. That was a
+  // count of UTC days, so the counter rolled over at UTC midnight — 8pm
+  // local here — rather than at the local midnight anyone would expect.
   if (timeSynced) {
-    uint32_t today = (uint32_t)(time(nullptr) / 86400);
+    time_t nowEpoch = time(nullptr);
+    struct tm lt;
+    localtime_r(&nowEpoch, &lt);
+    uint32_t today = (uint32_t)((lt.tm_year + 1900) * 10000u + (lt.tm_mon + 1) * 100u + lt.tm_mday);
     if (lastDayMarker != 0 && today != lastDayMarker) {
+      Serial.printf("[pipboy] new day (%lu -> %lu), resetting steps\n",
+                    (unsigned long)lastDayMarker, (unsigned long)today);
       stepCounter.set(0);
+      lastDayMarker = today;
+      saveState(); // persist immediately so a reboot can't resurrect yesterday's count
     }
     lastDayMarker = today;
   }
@@ -1835,12 +1990,63 @@ void loop() {
         Serial.printf("[pipboy] lift: held=%lums dx=%d dy=%d screen=%u dimWake=%d\n",
                       (unsigned long)heldMs, rawDx, rawDy, currentScreen, touchWasDimWake);
 
-        if (currentScreen == SCREEN_NOTIF && notifCount > 1 && !touchWasDimWake &&
-            abs(visualScroll) >= SWIPE_MIN_DIST && abs(visualScroll) > abs(visualSwipe)) {
+        bool scrollGesture = !touchWasDimWake && abs(visualScroll) >= SWIPE_MIN_DIST &&
+                             abs(visualScroll) > abs(visualSwipe);
+        bool tapGesture = !touchWasDimWake && heldStill && heldMs < TAP_MAX_MS;
+
+        if (scrollGesture && currentScreen == SCREEN_NOTIF && notifCount > 1) {
           if (visualScroll > 0 && notifIndex + 1 < notifCount) notifIndex++;
           else if (visualScroll < 0 && notifIndex > 0) notifIndex--;
           notifAutoShown = false; // user's driving now, stop the auto-revert timer
           forceRedraw = true;
+
+        } else if (scrollGesture && currentScreen == SCREEN_STOPWATCH && !swRunning) {
+          // Clearing only while stopped: wiping a running stopwatch with a
+          // stray swipe would be a genuinely annoying way to lose a timing.
+          swAccumMs = 0;
+          forceRedraw = true;
+
+        } else if (scrollGesture && currentScreen == SCREEN_TIMER && !timerRunning) {
+          // Cycles the preset list. Only while stopped, for the same reason.
+          timerLoad(visualScroll > 0 ? timerPresetIdx + 1
+                                     : timerPresetIdx + TIMER_PRESET_COUNT - 1);
+          forceRedraw = true;
+
+        } else if (tapGesture && currentScreen == SCREEN_STOPWATCH) {
+          if (swRunning) {
+            swAccumMs += millis() - swStartMs; // bank the running segment
+            swRunning = false;
+          } else {
+            swStartMs = millis();
+            swRunning = true;
+          }
+          forceRedraw = true;
+
+        } else if (tapGesture && currentScreen == SCREEN_TIMER) {
+          if (timerFired) {
+            timerLoad(timerPresetIdx); // acknowledge and rearm at the same duration
+          } else if (timerRunning) {
+            timerRemainMs = timerRemainingMs(); // freeze what's left
+            timerRunning = false;
+          } else if (timerRemainMs > 0) {
+            timerEndMs = millis() + timerRemainMs;
+            timerRunning = true;
+          }
+          forceRedraw = true;
+
+        } else if (tapGesture && currentScreen == SCREEN_DATA) {
+          // Two-step so a stray tap can't wipe a day's step count: the first
+          // arms it and says so, a second within the window confirms.
+          if (stepsResetArmedMs && now - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
+            stepCounter.set(0);
+            saveState();
+            stepsResetArmedMs = 0;
+            Serial.println("[pipboy] steps reset by user.");
+          } else {
+            stepsResetArmedMs = now;
+          }
+          forceRedraw = true;
+
         } else
 
         // A touch that woke the dimmed screen is barred from *navigating*
@@ -1934,10 +2140,35 @@ void loop() {
   time_t nowSec = time(nullptr);
   struct tm t;
   localtime_r(&nowSec, &t);
-  if (forceRedraw || t.tm_sec != lastRenderedSecond) {
+  // A running stopwatch shows tenths, so it needs redrawing faster than the
+  // once-a-second everything else settles for — but only while its own
+  // screen is actually up.
+  bool fastTick = (currentScreen == SCREEN_STOPWATCH && swRunning &&
+                   now - lastFastDrawMs >= 100);
+  if (forceRedraw || t.tm_sec != lastRenderedSecond || fastTick) {
     render(forceRedraw);
     lastRenderedSecond = t.tm_sec;
+    lastFastDrawMs = now;
     forceRedraw = false;
+  }
+
+  // Countdown expiry is checked regardless of which screen is showing, so a
+  // timer set and then navigated away from still goes off.
+  if (timerRunning && timerRemainingMs() == 0) {
+    timerRunning = false;
+    timerRemainMs = 0;
+    timerFired = true;
+    timerFiredMs = now;
+    currentScreen = SCREEN_TIMER;
+    wakeScreen(now);
+    Serial.println("[pipboy] timer expired.");
+  }
+
+  // The armed step-reset prompt expires on its own; repaint once when it
+  // does so the prompt doesn't sit there looking still-armed.
+  if (stepsResetArmedMs && now - stepsResetArmedMs >= STEPS_RESET_ARM_MS) {
+    stepsResetArmedMs = 0;
+    forceRedraw = true;
   }
 
   // Persist steps every 30s so a reboot/charge doesn't lose today's count.
