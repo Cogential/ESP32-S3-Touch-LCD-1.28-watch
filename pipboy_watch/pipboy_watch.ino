@@ -167,6 +167,16 @@ static const uint16_t COL_GREEN     = lgfx::color565(85, 255, 110);   // bright 
 // harder to read than the clock sitting next to it.
 static const uint16_t COL_GREEN_DIM = lgfx::color565(25, 95, 40);
 static const uint16_t COL_AMBER     = lgfx::color565(255, 170, 60);   // fault/status accent
+
+// Per-screen accents. Each section owns a colour so you can tell at a glance
+// which one you're on. All are kept at high luminance against the black
+// background — on this panel a dark colour reads as unlit rather than as
+// "darker", which is the same legibility problem the dim green had.
+static const uint16_t COL_YELLOW    = lgfx::color565(255, 220, 70);   // weather
+static const uint16_t COL_BLUE      = lgfx::color565(90, 175, 255);   // notifications
+static const uint16_t COL_RED       = lgfx::color565(255, 85, 75);    // stopwatch
+static const uint16_t COL_PURPLE    = lgfx::color565(175, 110, 255);  // timer
+static const uint16_t COL_ORANGE    = lgfx::color565(255, 150, 50);   // steps
 static const uint16_t COL_SCANLINE  = lgfx::color565(0, 30, 10);      // faint CRT texture
 
 // ---------- globals ----------
@@ -990,7 +1000,7 @@ void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now)
 // Font7 for the 7-segment digital-clock look) — the old bitmap fonts read
 // too soft/rounded up close. Always set font+size together so there's no
 // risk of a leftover scale from one screen leaking into another.
-void useSharpSmallFont() { display.setFont(&fonts::FreeMonoBold9pt7b); display.setTextSize(0.75f); }
+void useSharpSmallFont() { display.setFont(&fonts::FreeMonoBold9pt7b); display.setTextSize(0.9f); }
 void useSharpMedFont()   { display.setFont(&fonts::FreeMonoBold12pt7b); display.setTextSize(1.0f); }
 // A step up from the small face for the STAT screen's date/weather rows,
 // but held just under full medium: at 1.0 a full-width date overruns the
@@ -1057,7 +1067,7 @@ void drawBatteryIcon(int x, int y, int pct) {
 // same exact position/style on every screen. Width measured at runtime so
 // it stays centered regardless of whether the percentage is 1, 2, or 3
 // digits.
-void drawBleBattCluster(int battPct) {
+void drawBleBattCluster(int battPct, uint16_t col = COL_GREEN) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
   char pctbuf[8];
@@ -1076,7 +1086,7 @@ void drawBleBattCluster(int battPct) {
   int battX = startX + BT_W + GAP1;
   drawBatteryIcon(battX, rowY - 5, battPct);
   display.setTextDatum(middle_left);
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(col, COL_BG);
   display.drawString(pctbuf, battX + BATT_W + GAP2, rowY);
   display.setTextDatum(middle_center);
 }
@@ -1109,7 +1119,7 @@ int bigTempWidth(int tempC) {
 }
 
 // Draws the group with its left edge at x (not centred — see bigTempWidth).
-void drawBigTempAt(int x, int cy, int tempC) {
+void drawBigTempAt(int x, int cy, int tempC, uint16_t col = COL_GREEN) {
   char numbuf[8];
   snprintf(numbuf, sizeof(numbuf), "%d", tempC);
 
@@ -1121,7 +1131,7 @@ void drawBigTempAt(int x, int cy, int tempC) {
   const int GAP = BIGTEMP_GAP, RING_R = BIGTEMP_RING_R, RING_GAP = BIGTEMP_RING_GAP;
 
   display.setTextDatum(middle_left);
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(col, COL_BG);
   display.setFont(&fonts::Font7);
   display.setTextSize(0.85f);
   display.drawString(numbuf, x, cy);
@@ -1130,11 +1140,11 @@ void drawBigTempAt(int x, int cy, int tempC) {
   // Ring sits up near the top of the digits, the way a degree mark reads.
   int ringX = x + numW + GAP + RING_R;
   int ringY = cy - 13;
-  display.drawCircle(ringX, ringY, RING_R, COL_GREEN);
-  display.drawCircle(ringX, ringY, RING_R - 1, COL_GREEN); // doubled so it survives at this size
+  display.drawCircle(ringX, ringY, RING_R, col);
+  display.drawCircle(ringX, ringY, RING_R - 1, col); // doubled so it survives at this size
 
   useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(col, COL_BG);
   display.drawString("C", ringX + RING_R + RING_GAP, cy);
   display.setTextDatum(middle_center);
 }
@@ -1348,7 +1358,8 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
   // Current temperature + condition only — the high/low pair lives on the
   // dedicated WEATHER screen, where there's room to label it properly.
   if (hasWeather && !weatherTooStale()) {
-    drawTempRow(120, 190, weatherTempC, weatherTxt, COL_GREEN);
+    // Yellow to match the WEATHER screen this row summarises.
+    drawTempRow(120, 190, weatherTempC, weatherTxt, COL_YELLOW);
   } else {
     // Blank the row so a stale reading can't linger between redraws.
     useSharpRowFont();
@@ -1362,12 +1373,12 @@ void drawDataScreen(int steps, int battPct) {
   display.setTextDatum(middle_center);
 
   useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_ORANGE, COL_BG);
   display.drawString("Steps", 120, 80);
 
   char stepbuf[12];
   snprintf(stepbuf, sizeof(stepbuf), "%lu", (unsigned long)steps);
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_ORANGE, COL_BG);
   display.setFont(&fonts::Font7);
   display.drawString(stepbuf, 120, 120);
 
@@ -1379,9 +1390,9 @@ void drawDataScreen(int steps, int battPct) {
     char prompt[28];
     snprintf(prompt, sizeof(prompt), " RESET? TAP %u MORE ", STEPS_RESET_TAPS - stepsResetTaps);
     display.drawString(prompt, 120, 168);
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_ORANGE, COL_BG);
     display.drawString("                    ", 120, 188);
-    drawBleBattCluster(battPct);
+    drawBleBattCluster(battPct, COL_ORANGE);
     return;
   }
 
@@ -1389,11 +1400,11 @@ void drawDataScreen(int steps, int battPct) {
   char distbuf[24];
   snprintf(distbuf, sizeof(distbuf), "~%.2f KM", km);
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_ORANGE, COL_BG);
   display.drawString(distbuf, 120, 168);
   display.drawString(" tap 4x to reset  ", 120, 188);
 
-  drawBleBattCluster(battPct);
+  drawBleBattCluster(battPct, COL_ORANGE);
 }
 
 // Fuller weather view than the compact line embedded in STAT — same data
@@ -1406,11 +1417,11 @@ void drawWeatherScreen(int battPct) {
   bool showWeather = hasWeather && !weatherTooStale();
 
   useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_YELLOW, COL_BG);
   display.drawString("Weather", 120, showWeather ? 56 : 80);
 
   if (!showWeather) {
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_YELLOW, COL_BG);
     display.drawString("-- NO DATA --", 120, 120);
     useSharpSmallFont();
     // Gadgetbridge has no weather source of its own — it only relays what
@@ -1428,15 +1439,15 @@ void drawWeatherScreen(int battPct) {
     int tempW = bigTempWidth(weatherTempC);
     int groupX = 120 - (ICON_S + ICON_GAP + tempW) / 2;
     drawWeatherIcon(groupX, 100 - ICON_S / 2, ICON_S,
-                    weatherIconFor(weatherCode, weatherTxt), COL_GREEN);
-    drawBigTempAt(groupX + ICON_S + ICON_GAP, 100, weatherTempC);
+                    weatherIconFor(weatherCode, weatherTxt), COL_YELLOW);
+    drawBigTempAt(groupX + ICON_S + ICON_GAP, 100, weatherTempC, COL_YELLOW);
 
     // Condition, with an age suffix once the reading is no longer fresh —
     // this data can be restored from flash across a reboot, so it must not
     // present itself as current when it isn't. Padded on both sides so a
     // longer caption from the previous frame can't leave fragments behind.
     useSharpSmallFont();
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_YELLOW, COL_BG);
     long age = weatherAgeSec();
     String line = weatherTxt;
     if (age > WEATHER_FRESH_SEC) {
@@ -1451,7 +1462,7 @@ void drawWeatherScreen(int battPct) {
     // won't fit on a single line at this size, and stacking them leaves
     // clearance above the BLE/battery cluster at y=213.
     useSharpMedFont();
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_YELLOW, COL_BG);
     char hiBuf[16], loBuf[16];
     snprintf(hiBuf, sizeof(hiBuf), "High: %d", weatherHiC);
     snprintf(loBuf, sizeof(loBuf), "Low: %d", weatherLoC);
@@ -1459,7 +1470,7 @@ void drawWeatherScreen(int battPct) {
     display.drawString(loBuf, 120, 190);
   }
 
-  drawBleBattCluster(battPct);
+  drawBleBattCluster(battPct, COL_YELLOW);
 }
 
 // Draws `text` word-wrapped inside a `maxWidth`-px column, centered,
@@ -1513,7 +1524,7 @@ void timerLoad(uint8_t presetIdx) {
 void drawStopwatchScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_RED, COL_BG);
   display.drawString("Stopwatch", 120, 66);
 
   uint32_t ms = stopwatchElapsedMs();
@@ -1525,24 +1536,24 @@ void drawStopwatchScreen(int battPct) {
            (unsigned long)(ms / 60000UL),
            (unsigned long)((ms / 1000UL) % 60UL),
            (unsigned long)((ms / 100UL) % 10UL));
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_RED, COL_BG);
   display.setFont(&fonts::Font7);
   display.setTextSize(0.75f);
   display.drawString(buf, 120, 118);
   display.setTextSize(1.0f);
 
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_RED, COL_BG);
   display.drawString(swRunning ? " tap to stop " : " tap to start ", 120, 162);
   display.drawString(swRunning || stopwatchElapsedMs() == 0 ? "             " : " swipe to clear ", 120, 182);
 
-  drawBleBattCluster(battPct);
+  drawBleBattCluster(battPct, COL_RED);
 }
 
 void drawTimerScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_PURPLE, COL_BG);
   display.drawString("Timer", 120, 66);
 
   uint32_t ms = timerRemainingMs();
@@ -1552,7 +1563,7 @@ void drawTimerScreen(int battPct) {
 
   // Amber once it has expired — the one state that wants to be noticed
   // from across a room, and the palette already reserves amber for that.
-  display.setTextColor(timerFired ? COL_AMBER : COL_GREEN, COL_BG);
+  display.setTextColor(timerFired ? COL_AMBER : COL_PURPLE, COL_BG);
   display.setFont(&fonts::Font7);
   display.setTextSize(0.85f);
   display.drawString(buf, 120, 118);
@@ -1562,21 +1573,21 @@ void drawTimerScreen(int battPct) {
   if (timerFired) {
     display.setTextColor(COL_AMBER, COL_BG);
     display.drawString("  -- TIME UP --  ", 120, 162);
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_PURPLE, COL_BG);
     display.drawString("  tap to reset   ", 120, 182);
   } else {
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_PURPLE, COL_BG);
     display.drawString(timerRunning ? "  tap to pause  " : "  tap to start  ", 120, 162);
     display.drawString(timerRunning ? "                " : " swipe: set time ", 120, 182);
   }
 
-  drawBleBattCluster(battPct);
+  drawBleBattCluster(battPct, COL_PURPLE);
 }
 
 void drawNotifScreen(int battPct) {
   display.setTextDatum(middle_center);
   useSharpSmallFont();
-  display.setTextColor(COL_GREEN, COL_BG);
+  display.setTextColor(COL_BLUE, COL_BG);
   // Header doubles as the position indicator once more than one is held,
   // so it's obvious there are others to scroll to.
   if (notifCount > 1) {
@@ -1588,7 +1599,7 @@ void drawNotifScreen(int battPct) {
   }
 
   if (!notifCount) {
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_BLUE, COL_BG);
     display.drawString("-- NONE YET --", 120, 120);
     // The setup hint is only useful before there's a phone connected —
     // once BLE is up, "none yet" just means nothing has arrived, and the
@@ -1603,25 +1614,25 @@ void drawNotifScreen(int battPct) {
     }
   } else {
     const Notif &n = notifs[notifIndex];
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_BLUE, COL_BG);
     display.drawString(n.src.length() ? n.src : "NOTIFICATION", 120, 70);
 
     useSharpSmallFont();
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_BLUE, COL_BG);
     drawWrapped(n.title, 92, 190, 16, 2);
 
-    display.setTextColor(COL_GREEN, COL_BG);
+    display.setTextColor(COL_BLUE, COL_BG);
     drawWrapped(n.body, 134, 190, 16, 4);
 
     // Hint that there's more than one, and which way to move through them.
     if (notifCount > 1) {
-      display.setTextColor(COL_GREEN, COL_BG);
+      display.setTextColor(COL_BLUE, COL_BG);
       display.drawString(notifIndex > 0 ? "^" : " ", 120, 60);
       display.drawString(notifIndex + 1 < notifCount ? "v" : " ", 120, 198);
     }
   }
 
-  drawBleBattCluster(battPct);
+  drawBleBattCluster(battPct, COL_BLUE);
 }
 
 // Vault Boy, traced from a real reference photo down to a 1bpp bitmap (see
