@@ -102,7 +102,17 @@ static const time_t WAKE_RESYNC_INTERVAL_SEC = 30 * 60; // 30m
 // ---------- power saving ----------
 static const uint8_t BRIGHT_ACTIVE = 180;
 static const uint8_t BRIGHT_DIM = 12;
-static const uint32_t IDLE_DIM_TIMEOUT_MS = 20000; // dim backlight after 20s of no touch (or gyro wake — see wakeScreen())
+static const uint32_t IDLE_DIM_TIMEOUT_MS = 20000; // default; adjustable at runtime via cfgDimTimeoutMs below
+
+// ---------- user settings ----------
+// Everything here was a compile-time constant until the settings screen
+// existed; the constants above are now just the defaults these start from.
+// Persisted in the same NVS namespace as steps/weather — see loadState()
+// and saveSettings().
+uint8_t cfgBrightness = BRIGHT_ACTIVE;
+uint32_t cfgDimTimeoutMs = IDLE_DIM_TIMEOUT_MS;
+bool cfgScanlines = true;
+bool cfgTime24h = false;
 // Deep sleep after this long untouched. Note what this costs: deep sleep drops
 // BLE, so notifications stop arriving until the watch is woken. That is the
 // point of the trade — an idle watch that is genuinely asleep rather than
@@ -234,7 +244,8 @@ const uint8_t SCREEN_WEATHER = 3;    // full weather
 const uint8_t SCREEN_NOTIF = 4;      // notification list
 const uint8_t SCREEN_MUSIC = 5;      // now-playing, from Gadgetbridge — grouped next to NOTIF
 const uint8_t SCREEN_STOPWATCH = 6;
-const uint8_t NUM_SCREENS = 7;
+const uint8_t SCREEN_SETTINGS = 7;   // reached by swiping down on STAT, deliberately not in the nav ring
+const uint8_t NUM_SCREENS = 8;
 // TIMER and FLASHLIGHT removed by request — see git history (or
 // pipboy_watch.ino, which still has both) if either needs reviving.
 // Nothing persists currentScreen across a boot (it always starts back at
@@ -674,21 +685,48 @@ void setupBLE() {
   bleAdvertising->start();
 }
 
+// Every watch->phone message goes out through here: a blank line to flush
+// whatever partial line the far side may be holding, then the JSON with a
+// single trailing space before the newline.
+//
+// That space is load-bearing, not a typo. Gadgetbridge was rejecting these
+// as "Malformed json ... unterminated object at character N", and N pinned
+// the cause down exactly: 27 for "previous", 24 for "pause", 23 for "next"
+// — in each case the position of the closing quote of the value, i.e. it
+// received the whole object except the final '}'. One byte, always the
+// last one of the line.
+//
+// An earlier attempt padded *after* the newline, on the theory the tail of
+// the transmission was being cut. Those same three numbers came back
+// unchanged, ruling that out: what's lost isn't the end of the payload,
+// it's the last character of the line — an off-by-one in how the line is
+// sliced on the far side. The trailing space gives that off-by-one
+// something harmless to eat. If it's ever fixed upstream, a stray trailing
+// space inside the line is still valid JSON whitespace, so this stays
+// correct either way.
+void sendGadgetbridgeLine(const char *json) {
+  if (!bleConnected || !nusTxChar) return;
+  nusTxChar->setValue((uint8_t *)"\n", 1);
+  nusTxChar->notify();
+
+  char line[256];
+  int n = snprintf(line, sizeof(line), "%s \n", json);
+  if (n <= 0) return;
+  if (n > (int)sizeof(line) - 1) n = sizeof(line) - 1; // snprintf reports what it *would* have written
+  nusTxChar->setValue((uint8_t *)line, n);
+  nusTxChar->notify();
+  Serial.printf("[pipboy] GB tx: %.200s\n", json);
+}
+
 // Sends a media-control command back to the phone, for the MUSIC screen's
-// tap-to-play/pause. cmd is one of "play", "pause", "playpause", "next",
+// transport buttons. cmd is one of "play", "pause", "playpause", "next",
 // "previous", "volumeup", "volumedown".
 //
-// This used to send `Bangle.musicControl("play")`, flagged at the time as
-// an educated guess that hadn't been tested against a real phone — and it
-// was wrong: confirmed against gbmusic.app.js, the actual Bangle.js app
+// Format confirmed against gbmusic.app.js, the actual Bangle.js app
 // Gadgetbridge's music support is built against
-// (github.com/espruino/BangleApps, apps/gbmusic/app.js), a button press
-// there sends a blank line followed by JSON —
-//   Bluetooth.println("");
-//   Bluetooth.println(JSON.stringify({t: "music", n: command}));
-// — the same {t:"...", ...} convention every other Gadgetbridge message in
-// this file already uses, not a JS function call at all. That mismatch is
-// why tapping play/pause did nothing.
+// (github.com/espruino/BangleApps, apps/gbmusic/app.js) — the same
+// {t:"...", ...} convention every other message here uses, not the
+// Bangle.musicControl() JS call an earlier guess assumed.
 void sendMusicControl(const char *cmd) {
   if (!bleConnected || !nusTxChar) return;
   // Note the space before the newline — it is load-bearing, not a typo.
@@ -710,13 +748,9 @@ void sendMusicControl(const char *cmd) {
   // brace, leaving complete JSON. If the far side is ever fixed, a stray
   // trailing space inside the line is still valid JSON whitespace, so this
   // stays correct either way.
-  nusTxChar->setValue((uint8_t *)"\n", 1);
-  nusTxChar->notify();
   char buf[48];
-  int n = snprintf(buf, sizeof(buf), "{\"t\":\"music\",\"n\":\"%s\"} \n", cmd);
-  nusTxChar->setValue((uint8_t *)buf, n);
-  nusTxChar->notify();
-  Serial.printf("[pipboy] sent music control: %s (%d bytes)\n", cmd, n);
+  snprintf(buf, sizeof(buf), "{\"t\":\"music\",\"n\":\"%s\"}", cmd);
+  sendGadgetbridgeLine(buf);
 }
 
 // ---------- WiFi / NTP time sync ----------
@@ -993,6 +1027,12 @@ void loadState() {
   size_t histLen = prefs.getBytes("stepHist", stepHist, sizeof(stepHist));
   if (histLen != sizeof(stepHist)) memset(stepHist, 0, sizeof(stepHist));
 
+  // User settings — each falls back to the compile-time default if unset.
+  cfgBrightness = (uint8_t)prefs.getUChar("cfgBright", BRIGHT_ACTIVE);
+  cfgDimTimeoutMs = prefs.getULong("cfgDim", IDLE_DIM_TIMEOUT_MS);
+  cfgScanlines = prefs.getBool("cfgScan", true);
+  cfgTime24h = prefs.getBool("cfg24h", false);
+
   // Restore the last weather so a reboot isn't stuck on "NO DATA" until the
   // phone next pushes. Age is judged at draw time, not here: this runs
   // before NTP/BLE time sync, so the clock usually isn't trustworthy yet.
@@ -1005,6 +1045,18 @@ void loadState() {
     weatherCode = prefs.getInt("wCode", 0);
     hasWeather = true;
   }
+  prefs.end();
+}
+
+// Settings are written on change rather than on the periodic saveState()
+// tick — they change rarely and a stale value surviving a reboot would be
+// more annoying than the handful of extra flash writes.
+void saveSettings() {
+  prefs.begin("pipboy", false);
+  prefs.putUChar("cfgBright", cfgBrightness);
+  prefs.putULong("cfgDim", cfgDimTimeoutMs);
+  prefs.putBool("cfgScan", cfgScanlines);
+  prefs.putBool("cfg24h", cfgTime24h);
   prefs.end();
 }
 
@@ -1214,7 +1266,7 @@ void enterCriticalBatterySleep(int mv) {
 // burst's context (how long it's been rotating) is now stale and shouldn't
 // resolve later against a screen state that's already changed.
 void wakeScreen(uint32_t now) {
-  display.setBrightness(BRIGHT_ACTIVE);
+  display.setBrightness(cfgBrightness);
   backlightDimmed = false;
   forceRedraw = true;
   lastActivityMs = now;
@@ -1635,7 +1687,14 @@ void onScreenGesture(lv_event_t *e) {
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
 
-  if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
+  if (dir == LV_DIR_BOTTOM && currentScreen == SCREEN_STAT) {
+    // The one navigation gesture left: a downward swipe on the clock face
+    // pulls settings down. Kept as a gesture rather than a seventh nav
+    // badge so the ring's spacing stays as-is. Flip to LV_DIR_TOP if it
+    // turns out to read backwards on the panel.
+    goToScreen(SCREEN_SETTINGS);
+
+  } else if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
     if (currentScreen == SCREEN_STOPWATCH && !swRunning) {
       swAccumMs = 0;
       forceRedraw = true;
@@ -1904,10 +1963,14 @@ void updateStatScreen(struct tm &t, int battPct) {
     lv_obj_set_style_bg_color(navNotifBtn, notifCount ? lv_color_hex(0x5AAFFF) : lv_color_black(), 0);
   }
 
-  int hour12 = t.tm_hour % 12;
-  if (hour12 == 0) hour12 = 12;
   char timebuf[16];
-  snprintf(timebuf, sizeof(timebuf), "%d:%02d", hour12, t.tm_min);
+  if (cfgTime24h) {
+    snprintf(timebuf, sizeof(timebuf), "%02d:%02d", t.tm_hour, t.tm_min);
+  } else {
+    int hour12 = t.tm_hour % 12;
+    if (hour12 == 0) hour12 = 12;
+    snprintf(timebuf, sizeof(timebuf), "%d:%02d", hour12, t.tm_min);
+  }
   lv_label_set_text(statTime, timebuf);
 
   static const char *wd[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
@@ -2148,6 +2211,33 @@ lv_obj_t *notifHeader, *notifList, *notifCards[MAX_NOTIFS];
 lv_obj_t *notifCardSrc[MAX_NOTIFS], *notifCardTitle[MAX_NOTIFS], *notifCardBody[MAX_NOTIFS];
 lv_obj_t *notifNone1, *notifNone2;
 
+// Dismiss one notification from the watch. Tells the phone first — format
+// per Espruino's Gadgetbridge protocol docs, {"t":"notify","id":N,
+// "n":"DISMISS"} — then clears it locally rather than waiting for the
+// phone to echo a notify- back, so the card disappears the moment it's
+// tapped.
+void onNotifDismiss(lv_event_t *e) {
+  noteTouchActivity();
+  uint8_t idx = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+  if (idx >= notifCount) return;
+
+  long id = notifs[idx].id;
+  if (id != 0) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"t\":\"notify\",\"id\":%ld,\"n\":\"DISMISS\"}", id);
+    sendGadgetbridgeLine(buf);
+  }
+
+  // Removed by index rather than through notifRemove(id): an id of 0 means
+  // the sender never gave us a usable one, and notifRemove treats that as
+  // "drop the newest", which would clear the wrong card here.
+  for (uint8_t j = idx; j + 1 < notifCount; j++) notifs[j] = notifs[j + 1];
+  notifCount--;
+  notifs[notifCount] = Notif(); // release the vacated slot's String memory
+  if (notifIndex >= notifCount) notifIndex = notifCount ? notifCount - 1 : 0;
+  forceRedraw = true;
+}
+
 void buildNotifScreen() {
   lv_obj_t *s = screens[SCREEN_NOTIF] = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(s, lv_color_black(), 0);
@@ -2192,6 +2282,26 @@ void buildNotifScreen() {
     lv_obj_set_style_text_color(notifCardBody[i], lv_color_hex(0xAAAAAA), 0);
     lv_label_set_long_mode(notifCardBody[i], LV_LABEL_LONG_WRAP);
     lv_obj_set_width(notifCardBody[i], 180);
+
+    // Dismiss button, pinned to the card's top-right. IGNORE_LAYOUT keeps
+    // the card's flex column from treating it as another stacked row.
+    lv_obj_t *dismiss = lv_button_create(card);
+    lv_obj_add_flag(dismiss, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_set_size(dismiss, 24, 24);
+    lv_obj_set_style_radius(dismiss, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dismiss, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(dismiss, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(dismiss, accent, 0);
+    lv_obj_set_style_border_width(dismiss, 1, 0);
+    lv_obj_set_style_shadow_width(dismiss, 0, 0);
+    lv_obj_set_style_bg_color(dismiss, accent, LV_STATE_PRESSED);
+    lv_obj_align(dismiss, LV_ALIGN_TOP_RIGHT, 4, -4);
+    lv_obj_add_event_cb(dismiss, onNotifDismiss, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+    lv_obj_t *dl = lv_label_create(dismiss);
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(dl, accent, 0);
+    lv_label_set_text(dl, LV_SYMBOL_CLOSE);
+    lv_obj_center(dl);
 
     lv_obj_add_flag(card, LV_OBJ_FLAG_HIDDEN);
   }
@@ -2468,6 +2578,174 @@ void updateStopwatchScreen(int battPct) {
 }
 
 
+// ---------- screen: SETTINGS ----------
+// Reached by swiping down on the clock face rather than taking a seventh
+// slot in the nav ring — the ring's spacing was settled and adding another
+// badge would have meant shrinking or crowding all of them.
+//
+// Every value here was a compile-time constant before this screen existed;
+// each writes through to NVS on change (saveSettings()) so it survives a
+// reboot.
+lv_obj_t *setBrightVal, *setDimVal, *setScanSw, *set24hSw;
+
+static const uint32_t DIM_PRESETS_MS[] = {10000, 20000, 40000, 60000, 0}; // 0 = never dim
+static const uint8_t DIM_PRESET_COUNT = sizeof(DIM_PRESETS_MS) / sizeof(DIM_PRESETS_MS[0]);
+
+void settingsRefreshValues() {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d%%", (int)((cfgBrightness * 100 + 127) / 255));
+  lv_label_set_text(setBrightVal, buf);
+
+  if (cfgDimTimeoutMs == 0) snprintf(buf, sizeof(buf), "never");
+  else snprintf(buf, sizeof(buf), "%lus", (unsigned long)(cfgDimTimeoutMs / 1000));
+  lv_label_set_text(setDimVal, buf);
+}
+
+void onBrightAdjust(lv_event_t *e) {
+  noteTouchActivity();
+  int delta = (int)(intptr_t)lv_event_get_user_data(e);
+  int v = (int)cfgBrightness + delta;
+  if (v < 20) v = 20;    // floor: below this the panel is effectively unreadable
+  if (v > 255) v = 255;
+  cfgBrightness = (uint8_t)v;
+  display.setBrightness(cfgBrightness); // apply immediately so the change is visible while adjusting
+  settingsRefreshValues();
+  saveSettings();
+}
+
+void onDimCycle(lv_event_t *e) {
+  noteTouchActivity();
+  uint8_t idx = 0;
+  for (uint8_t i = 0; i < DIM_PRESET_COUNT; i++) {
+    if (DIM_PRESETS_MS[i] == cfgDimTimeoutMs) { idx = i; break; }
+  }
+  cfgDimTimeoutMs = DIM_PRESETS_MS[(idx + 1) % DIM_PRESET_COUNT];
+  settingsRefreshValues();
+  saveSettings();
+}
+
+void onScanToggle(lv_event_t *e) {
+  noteTouchActivity();
+  cfgScanlines = lv_obj_has_state(setScanSw, LV_STATE_CHECKED);
+  lv_obj_set_style_bg_image_opa(lv_layer_top(), cfgScanlines ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+  saveSettings();
+}
+
+void on24hToggle(lv_event_t *e) {
+  noteTouchActivity();
+  cfgTime24h = lv_obj_has_state(set24hSw, LV_STATE_CHECKED);
+  forceRedraw = true; // clock re-renders on the next refresh pass
+  saveSettings();
+}
+
+// One row of the settings list: a label on the left, caller's control on
+// the right. Returns the row so the caller can parent its control to it.
+lv_obj_t *makeSettingsRow(lv_obj_t *parent, const char *label, lv_color_t accent) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, 186, 34);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  lv_obj_t *lbl = lv_label_create(row);
+  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(lbl, accent, 0);
+  lv_label_set_text(lbl, label);
+  return row;
+}
+
+lv_obj_t *makeSettingsButton(lv_obj_t *parent, const char *text, lv_color_t accent,
+                             lv_event_cb_t cb, void *userData) {
+  lv_obj_t *btn = lv_button_create(parent);
+  lv_obj_set_size(btn, 30, 26);
+  lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(btn, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(btn, accent, 0);
+  lv_obj_set_style_border_width(btn, 1, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_set_style_bg_color(btn, accent, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, userData);
+  lv_obj_t *l = lv_label_create(btn);
+  lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(l, accent, 0);
+  lv_label_set_text(l, text);
+  lv_obj_center(l);
+  return btn;
+}
+
+void buildSettingsScreen() {
+  lv_obj_t *s = screens[SCREEN_SETTINGS] = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(s, lv_color_black(), 0);
+  lv_obj_set_scrollbar_mode(s, LV_SCROLLBAR_MODE_OFF);
+  lv_color_t accent = lv_color_hex(0x55FF6E); // COL_GREEN
+
+  lv_obj_t *title = lv_label_create(s);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(title, accent, 0);
+  lv_label_set_text(title, "Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 42);
+
+  // Scrollable so the list isn't limited by how much fits between the
+  // title and the back button on a round panel.
+  lv_obj_t *list = lv_obj_create(s);
+  lv_obj_remove_style_all(list);
+  lv_obj_set_size(list, 200, 118);
+  lv_obj_align(list, LV_ALIGN_CENTER, 0, 8);
+  lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_scroll_dir(list, LV_DIR_VER);
+  lv_obj_set_style_pad_row(list, 4, 0);
+
+  lv_obj_t *row = makeSettingsRow(list, "Brightness", accent);
+  lv_obj_t *brightBox = lv_obj_create(row);
+  lv_obj_remove_style_all(brightBox);
+  lv_obj_set_size(brightBox, 104, 28);
+  lv_obj_set_flex_flow(brightBox, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(brightBox, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(brightBox, 4, 0);
+  makeSettingsButton(brightBox, "-", accent, onBrightAdjust, (void *)(intptr_t)-25);
+  setBrightVal = lv_label_create(brightBox);
+  lv_obj_set_style_text_font(setBrightVal, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(setBrightVal, lv_color_white(), 0);
+  makeSettingsButton(brightBox, "+", accent, onBrightAdjust, (void *)(intptr_t)25);
+
+  row = makeSettingsRow(list, "Dim after", accent);
+  lv_obj_t *dimBtn = lv_button_create(row);
+  lv_obj_set_size(dimBtn, 74, 26);
+  lv_obj_set_style_radius(dimBtn, 13, 0);
+  lv_obj_set_style_bg_color(dimBtn, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(dimBtn, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(dimBtn, accent, 0);
+  lv_obj_set_style_border_width(dimBtn, 1, 0);
+  lv_obj_set_style_shadow_width(dimBtn, 0, 0);
+  lv_obj_set_style_bg_color(dimBtn, accent, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(dimBtn, onDimCycle, LV_EVENT_CLICKED, NULL);
+  setDimVal = lv_label_create(dimBtn);
+  lv_obj_set_style_text_font(setDimVal, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(setDimVal, lv_color_white(), 0);
+  lv_obj_center(setDimVal);
+
+  row = makeSettingsRow(list, "Scanlines", accent);
+  setScanSw = lv_switch_create(row);
+  lv_obj_set_size(setScanSw, 44, 22);
+  lv_obj_set_style_bg_color(setScanSw, accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_add_event_cb(setScanSw, onScanToggle, LV_EVENT_VALUE_CHANGED, NULL);
+  if (cfgScanlines) lv_obj_add_state(setScanSw, LV_STATE_CHECKED);
+
+  row = makeSettingsRow(list, "24-hour time", accent);
+  set24hSw = lv_switch_create(row);
+  lv_obj_set_size(set24hSw, 44, 22);
+  lv_obj_set_style_bg_color(set24hSw, accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
+  lv_obj_add_event_cb(set24hSw, on24hToggle, LV_EVENT_VALUE_CHANGED, NULL);
+  if (cfgTime24h) lv_obj_add_state(set24hSw, LV_STATE_CHECKED);
+
+  settingsRefreshValues();
+
+  clusterLabel[SCREEN_SETTINGS] = buildStatusCluster(s, accent);
+  addBackNav(s, SCREEN_SETTINGS, accent);
+}
+
 // ---------- refresh ----------
 // Updates every screen's dynamic content each tick (steps, time, battery,
 // etc.) rather than only the currently-visible one — the LVGL-retained-mode
@@ -2649,7 +2927,7 @@ void setup() {
   bool dispOk = display.init();
   Serial.printf("[pipboy] display.init() -> %d\n", dispOk);
   display.setRotation(1); // 90° clockwise — see the touch-remap comment up top for what this costs on the touch side
-  display.setBrightness(BRIGHT_ACTIVE);
+  display.setBrightness(cfgBrightness);
   lastActivityMs = millis();
   nextFlickerMs = lastActivityMs + 4000 + random(4000);
 
@@ -2766,7 +3044,9 @@ void setup() {
   buildNotifScreen();
   buildMusicScreen();
   buildStopwatchScreen();
+  buildSettingsScreen();
   buildScanlineOverlay();
+  lv_obj_set_style_bg_image_opa(lv_layer_top(), cfgScanlines ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
 
   for (uint8_t i = 0; i < NUM_SCREENS; i++) {
     lv_obj_add_event_cb(screens[i], onScreenPressed, LV_EVENT_PRESSED, NULL);
@@ -2853,15 +3133,15 @@ void loop() {
   // Idle-dim, CRT flicker, and auto-sleep — unchanged from pipboy_watch.ino;
   // none of this is LVGL's concern, it's backlight/power management
   // sitting below the UI layer either way.
-  if (touchOk && !backlightDimmed && now - lastActivityMs > IDLE_DIM_TIMEOUT_MS) {
+  if (touchOk && !backlightDimmed && cfgDimTimeoutMs && now - lastActivityMs > cfgDimTimeoutMs) {
     display.setBrightness(BRIGHT_DIM);
     backlightDimmed = true;
   }
 
   if (!backlightDimmed && now >= nextFlickerMs) {
-    display.setBrightness(BRIGHT_ACTIVE > 40 ? BRIGHT_ACTIVE - 40 : BRIGHT_ACTIVE / 2);
+    display.setBrightness(cfgBrightness > 40 ? cfgBrightness - 40 : cfgBrightness / 2);
     delay(30);
-    display.setBrightness(BRIGHT_ACTIVE);
+    display.setBrightness(cfgBrightness);
     nextFlickerMs = now + 4000 + random(4000);
   }
 
@@ -2880,6 +3160,35 @@ void loop() {
       snprintf(buf, sizeof(buf), "%lu", (unsigned long)stepCounter.count());
       stepsChar->setValue((uint8_t *)buf, strlen(buf));
     }
+  }
+
+  // Report activity to Gadgetbridge so steps land in its own charts, not
+  // just on the watch. Format per Espruino's Gadgetbridge protocol docs:
+  //   {"t":"act","ts":<ms since epoch>,"stp":<steps>,"hrm":0,"mov":0,"rt":0}
+  // `stp` is sent as the count accrued *since the last report*, not the
+  // running daily total — Gadgetbridge stores these as per-interval
+  // activity samples, so a cumulative value would read as a huge spike
+  // every minute. (That reading of the field is from the docs' wording
+  // rather than something confirmed against Gadgetbridge's charts, so if
+  // the totals there look wrong, this is the line to revisit.)
+  //
+  // Only sent once the clock is trustworthy: a sample timestamped from an
+  // unsynced clock would be filed under 1970 and pollute the history.
+  static uint32_t lastActReportMs = 0;
+  static uint32_t lastActSteps = 0;
+  if (bleConnected && timeSynced && now - lastActReportMs > 60000) {
+    uint32_t stepsNow = stepCounter.count();
+    // A day rollover (or a manual reset) takes the count backwards; report
+    // nothing for that interval rather than a negative-turned-huge delta.
+    uint32_t delta = (stepsNow >= lastActSteps) ? (stepsNow - lastActSteps) : 0;
+    lastActReportMs = now;
+    lastActSteps = stepsNow;
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"t\":\"act\",\"ts\":%llu000,\"stp\":%lu,\"hrm\":0,\"mov\":0,\"rt\":0}",
+             (unsigned long long)time(nullptr), (unsigned long)delta);
+    sendGadgetbridgeLine(buf);
   }
 
   // Refresh every screen's dynamic content once/second, or immediately when
