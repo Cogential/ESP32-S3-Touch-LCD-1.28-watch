@@ -85,6 +85,15 @@ static const char *POSIX_TZ = "EST5EDT,M3.2.0,M11.1.0/2";
 // Tracked in seconds of real wall-clock time (not millis()) because millis()
 // resets to 0 on every deep-sleep wake — see rtcLastSyncAttemptEpoch below.
 static const time_t WIFI_RESYNC_INTERVAL_SEC = 4 * 60 * 60; // 4h
+// Deep sleep tracks elapsed time using the RTC's internal RC oscillator
+// (esp_timer/the main crystal aren't powered), which is meaningfully less
+// accurate than the crystal-derived clock used while continuously awake —
+// drift on the order of a few percent of however long the nap lasted. So a
+// sleep-wake earns its own, much shorter, resync threshold rather than
+// sharing WIFI_RESYNC_INTERVAL_SEC with the continuously-awake case: a wake
+// after only 30-60 minutes asleep can already be visibly off, well before
+// 4h of *awake* drift would be.
+static const time_t WAKE_RESYNC_INTERVAL_SEC = 30 * 60; // 30m
 
 // ---------- power saving ----------
 static const uint8_t BRIGHT_ACTIVE = 180;
@@ -182,8 +191,12 @@ static const uint16_t COL_YELLOW    = lgfx::color565(255, 220, 70);   // weather
 static const uint16_t COL_BLUE      = lgfx::color565(90, 175, 255);   // notifications
 static const uint16_t COL_RED       = lgfx::color565(255, 85, 75);    // stopwatch
 static const uint16_t COL_PURPLE    = lgfx::color565(175, 110, 255);  // timer
-static const uint16_t COL_ORANGE    = lgfx::color565(255, 150, 50);   // steps
+static const uint16_t COL_ORANGE    = lgfx::color565(255, 150, 50);   // steps (and step history)
 static const uint16_t COL_SCANLINE  = lgfx::color565(0, 30, 10);      // faint CRT texture
+// Flashlight only. Deliberately off-theme: every other screen stays
+// monochrome green-phosphor, but the point of a flashlight is raw lumens to
+// see by, and white puts more light out of this panel than green alone.
+static const uint16_t COL_WHITE     = lgfx::color565(255, 255, 255);
 
 // ---------- globals ----------
 LGFX display;
@@ -198,13 +211,20 @@ bool imuOk = false;
 volatile bool bleConnected = false;
 volatile bool timeSynced = false;
 uint8_t currentScreen = 0; // see the SCREEN_* slots below
-const uint8_t SCREEN_STAT = 0;      // clock, date, weather line, notification banner
-const uint8_t SCREEN_DATA = 1;      // step count
-const uint8_t SCREEN_WEATHER = 2;   // full weather
-const uint8_t SCREEN_NOTIF = 3;     // notification list
-const uint8_t SCREEN_STOPWATCH = 4;
-const uint8_t SCREEN_TIMER = 5;
-const uint8_t NUM_SCREENS = 6;
+const uint8_t SCREEN_STAT = 0;       // clock, date, weather line, notification banner
+const uint8_t SCREEN_DATA = 1;       // step count
+const uint8_t SCREEN_HISTORY = 2;    // 7-day step history bar chart — grouped next to DATA
+const uint8_t SCREEN_WEATHER = 3;    // full weather
+const uint8_t SCREEN_NOTIF = 4;      // notification list
+const uint8_t SCREEN_MUSIC = 5;      // now-playing, from Gadgetbridge — grouped next to NOTIF
+const uint8_t SCREEN_STOPWATCH = 6;
+const uint8_t SCREEN_TIMER = 7;
+const uint8_t SCREEN_FLASHLIGHT = 8; // max-brightness solid fill; last in the cycle, out of the way
+const uint8_t NUM_SCREENS = 9;
+// Nothing persists currentScreen across a boot (it always starts back at
+// SCREEN_STAT — see wokeFromSleep in setup()), so renumbering these between
+// firmware versions is safe: no stored value anywhere depends on the
+// specific numbers.
 
 // ---------- stopwatch ----------
 // Both the stopwatch and the timer keep running while you're on other
@@ -281,6 +301,26 @@ static const time_t WEATHER_MAX_AGE_SEC = 12 * 60 * 60;
 // Below this, it's current enough not to bother captioning with an age.
 static const time_t WEATHER_FRESH_SEC = 15 * 60;
 
+// ---------- step history ----------
+// The past 6 *completed* days' final step totals, oldest first — index 5 is
+// the most recently finished day. "Today" is deliberately not stored here;
+// it's read live from stepCounter so the HISTORY screen's rightmost bar
+// updates as you walk instead of only appearing at day-rollover. Shifted
+// and persisted once/day — see the day-rollover block in loop() and
+// saveState().
+uint32_t stepHist[6] = {0, 0, 0, 0, 0, 0};
+
+// ---------- now playing (from Gadgetbridge) ----------
+// Populated from the Bangle.js "musicinfo"/"musicstate" messages Gadgetbridge
+// already sends over the same NUS channel as notify/weather — see
+// handleGadgetbridgeLine(). Not persisted: this is "what's playing right
+// now", stale the moment the phone disconnects, so there's nothing worth
+// restoring after a reboot.
+bool hasMusic = false;
+String musicArtist = "";
+String musicTrack = "";
+bool musicPlaying = false;
+
 // Latest gyro reading (deg/sec), updated every IMU poll alongside the accel
 // feed into StepCounter. Not consumed by anything yet — available for
 // whatever reads it next.
@@ -303,6 +343,8 @@ RTC_DATA_ATTR time_t rtcLastSyncAttemptEpoch = 0;
 uint32_t lastActivityMs = 0;
 bool backlightDimmed = false;
 uint32_t lastDayMarker = 0; // epoch-day steps were last reset on
+uint32_t nextFlickerMs = 0; // when the next CRT power-flicker blip is due — see loop()
+bool wasFlashlightScreen = false; // tracks entering/leaving SCREEN_FLASHLIGHT — see loop()
 int lastRenderedSecond = -1;
 
 // ---------- raise-to-wake state ----------
@@ -332,6 +374,9 @@ BLEServer *bleServer = nullptr;
 BLECharacteristic *stepsChar = nullptr;
 BLEAdvertising *bleAdvertising = nullptr;
 String nusRxBuffer = "";
+// TX is now also used for music control (see sendMusicControl()), so unlike
+// the other characteristics it needs to outlive setupBLE()'s local scope.
+BLECharacteristic *nusTxChar = nullptr;
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override {
@@ -503,8 +548,29 @@ void handleGadgetbridgeLine(const String &line) {
     weatherEpoch = (nowEpoch > 1700000000) ? nowEpoch : 0;
     saveWeather();
     Serial.printf("[pipboy] weather: %dC (%s)\n", weatherTempC, weatherTxt.c_str());
+
+  } else if (strcmp(type, "musicinfo") == 0) {
+    // Bangle.js "musicinfo": {t:"musicinfo", artist, album, track, dur, c, n}
+    // — sent once whenever the track changes, not on every poll, so this is
+    // deliberately sticky rather than re-derived each render.
+    musicArtist = String((const char *)(doc["artist"] | ""));
+    musicTrack = String((const char *)(doc["track"] | ""));
+    hasMusic = true;
+    forceRedraw = true;
+    Serial.printf("[pipboy] musicinfo: %s - %s\n", musicArtist.c_str(), musicTrack.c_str());
+
+  } else if (strcmp(type, "musicstate") == 0) {
+    // Bangle.js "musicstate": {t:"musicstate", state, position, shuffle, repeat}
+    // — state is "play" or "pause". Sent on its own, separately from
+    // musicinfo, so a track can arrive before we're told it's actually
+    // playing (or vice versa) — hasMusic is set by either, independently.
+    const char *state = doc["state"] | "";
+    musicPlaying = (strcmp(state, "play") == 0);
+    hasMusic = true;
+    forceRedraw = true;
+    Serial.printf("[pipboy] musicstate: %s\n", state);
   }
-  // Other message types (notify-, music, findPhone, etc.) are ignored for now.
+  // Other message types (notify-, findPhone, etc.) are ignored for now.
 }
 
 class NUSRxCallbacks : public BLECharacteristicCallbacks {
@@ -560,9 +626,10 @@ void setupBLE() {
   BLECharacteristic *rxChar = nus->createCharacteristic(
       NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rxChar->setCallbacks(new NUSRxCallbacks());
-  BLECharacteristic *txChar = nus->createCharacteristic(
-      NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
-  txChar->addDescriptor(new BLE2902());
+  // Kept as a global now (nusTxChar) instead of a local — sendMusicControl(),
+  // called from loop() on a MUSIC-screen tap, needs to reach it too.
+  nusTxChar = nus->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  nusTxChar->addDescriptor(new BLE2902());
   nus->start();
 
   bleAdvertising = BLEDevice::getAdvertising();
@@ -580,16 +647,39 @@ void setupBLE() {
   bleAdvertising->start();
 }
 
+// Sends a media-control command back to the phone, for the MUSIC screen's
+// tap-to-play/pause. cmd is one of "play", "pause", "next", "previous".
+//
+// UNVERIFIED against a real Gadgetbridge session — everything else this
+// file sends or parses (setTime, notify/notify-, weather) was confirmed
+// against an actual phone; this one line wasn't, because doing so needs a
+// phone with Gadgetbridge actually paired and playing music, not just this
+// board on a bench. It matches the call real Bangle.js firmware makes when
+// its own music-control widget is tapped, which is what Gadgetbridge's
+// Bangle.js support is documented to watch for on this same TX
+// characteristic — but "documented" isn't "tested here". If tapping the
+// MUSIC screen does nothing to the phone's playback, this line is the first
+// thing to check with a serial log and a packet capture.
+void sendMusicControl(const char *cmd) {
+  if (!bleConnected || !nusTxChar) return;
+  char buf[48];
+  int n = snprintf(buf, sizeof(buf), "Bangle.musicControl(\"%s\")\n", cmd);
+  nusTxChar->setValue((uint8_t *)buf, n);
+  nusTxChar->notify();
+  Serial.printf("[pipboy] sent music control: %s\n", cmd);
+}
+
 // ---------- WiFi / NTP time sync ----------
-// True if it's been over WIFI_RESYNC_INTERVAL_SEC of real wall-clock time
-// since the last resync *attempt* (successful or not — see
-// rtcLastSyncAttemptEpoch), or if the clock isn't valid yet at all. Callers
-// should stamp rtcLastSyncAttemptEpoch = time(nullptr) right before they
-// actually attempt a sync, win or lose, so a stretch with no WiFi in range
-// retries at a steady interval instead of every single wake.
-bool wifiResyncDue() {
+// True if it's been over intervalSec of real wall-clock time since the last
+// resync *attempt* (successful or not — see rtcLastSyncAttemptEpoch), or if
+// the clock isn't valid yet at all. Callers should stamp
+// rtcLastSyncAttemptEpoch = time(nullptr) right before they actually attempt
+// a sync, win or lose, so a stretch with no WiFi in range retries at a
+// steady interval instead of every single wake. Two call sites use two
+// different intervals on purpose — see WAKE_RESYNC_INTERVAL_SEC above.
+bool wifiResyncDue(time_t intervalSec = WIFI_RESYNC_INTERVAL_SEC) {
   if (!timeSynced) return true; // no valid clock yet — always worth trying
-  return (time(nullptr) - rtcLastSyncAttemptEpoch) > WIFI_RESYNC_INTERVAL_SEC;
+  return (time(nullptr) - rtcLastSyncAttemptEpoch) > intervalSec;
 }
 
 // Shared by every path below once WiFi is already associated. Blocking on
@@ -769,6 +859,16 @@ bool forceWifiSetupPortal() {
 static const int BATT_UNKNOWN = -1;
 static const int BATT_MIN_PLAUSIBLE_MV = 2800; // below a LiPo's protection cutoff
 static const int BATT_MAX_PLAUSIBLE_MV = 4350; // above a full cell plus charge headroom
+// Forces an early sleep (see enterCriticalBatterySleep(), called from
+// setup()) at or below this reading. Set well above BATT_MIN_PLAUSIBLE_MV
+// and above a typical LiPo protection IC's own cutoff (~2.9-3.0V) on
+// purpose — the goal is real margin before the cell gets anywhere near
+// whatever this board's one observed "won't power back on without a
+// physical battery reconnect" episode needed (see
+// pipboy-watch-battery-reconnect-fix in project memory), not to shave the
+// cutoff as close as the hardware allows. 3350mV sits just above the
+// lipoPercent() curve's own 0% floor (3300mV).
+static const int BATT_CRITICAL_MV = 3350;
 
 // A LiPo's voltage/charge relationship is markedly non-linear: it falls
 // quickly off the top, sits on a long plateau through the middle, then
@@ -799,19 +899,25 @@ int lipoPercent(int mv) {
   return 0;
 }
 
+// Shared by readBatteryPercent() and the critical-battery check in setup()
+// — same 8-sample average and 200k/100k divider scaling either way, so the
+// two can't ever disagree about what the cell's actual voltage is.
+// Averaged because a single ESP32 ADC read carries several tens of mV of
+// noise, which on a LiPo curve is worth a percent or two of jitter —
+// enough to make the displayed number wander while nothing is happening.
+int readBatteryMilliVolts() {
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < 8; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
+  return (int)(acc / 8) * 3; // 200k/100k divider
+}
+
 int readBatteryPercent() {
   static int cachedPct = BATT_UNKNOWN;
   static uint32_t lastReadMs = 0;
   static bool everRead = false;
   uint32_t now = millis();
   if (!everRead || now - lastReadMs > 30000) {
-    // Averaged: a single ESP32 ADC read carries several tens of mV of
-    // noise, which on a LiPo curve is worth a percent or two of jitter —
-    // enough to make the displayed number wander while nothing is
-    // happening.
-    uint32_t acc = 0;
-    for (uint8_t i = 0; i < 8; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
-    int mv = (int)(acc / 8) * 3; // 200k/100k divider
+    int mv = readBatteryMilliVolts();
     everRead = true;
     lastReadMs = now;
     if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
@@ -830,6 +936,12 @@ void loadState() {
   prefs.begin("pipboy", false);
   stepCounter.begin(prefs.getUInt("steps", 0));
   lastDayMarker = prefs.getUInt("dayMarker", 0);
+
+  // Past 6 completed days' totals for the HISTORY screen. getBytes() returns
+  // 0 (not sizeof(stepHist)) on first-ever boot, when the key doesn't exist
+  // yet — treated the same as "no history", not as corruption.
+  size_t histLen = prefs.getBytes("stepHist", stepHist, sizeof(stepHist));
+  if (histLen != sizeof(stepHist)) memset(stepHist, 0, sizeof(stepHist));
 
   // Restore the last weather so a reboot isn't stuck on "NO DATA" until the
   // phone next pushes. Age is judged at draw time, not here: this runs
@@ -887,6 +999,10 @@ void saveState() {
   prefs.begin("pipboy", false);
   prefs.putUInt("steps", steps);
   prefs.putUInt("dayMarker", lastDayMarker);
+  // stepHist only actually changes at day-rollover, which is exactly the
+  // moment lastDayMarker changes too — so this write is never wasted, and
+  // never needs its own separate change-tracking.
+  prefs.putBytes("stepHist", stepHist, sizeof(stepHist));
   prefs.end();
   lastSavedSteps = steps;
   lastSavedDayMarker = lastDayMarker;
@@ -931,30 +1047,11 @@ void setupPowerManagement() {
 // sleep is a full reset — everything except the RTC timer and flash-backed
 // state loses power, so the only way back is through setup() again from the
 // top. See the wake-from-sleep fast path near the top of setup().
-void enterDeepSleep() {
-  Serial.println("[pipboy] long-press -> entering deep sleep...");
-  saveState(); // catch any steps counted since the last periodic save
-
-  // Say so on screen before going dark. Without this, sleeping looks
-  // identical to a crash or a reboot — and since waking is a full restart,
-  // there's otherwise nothing to distinguish "it slept and woke" from "it
-  // never slept at all".
-  display.startWrite();
-  display.fillScreen(COL_BG);
-  display.setTextDatum(middle_center);
-  useSharpMedFont();
-  display.setTextColor(COL_GREEN, COL_BG);
-  display.drawString("SLEEP", 120, 112);
-  useSharpSmallFont();
-  display.setTextColor(COL_GREEN, COL_BG);
-  display.drawString("touch to wake", 120, 142);
-  display.endWrite();
-  delay(900);
-
-  display.startWrite();
-  display.fillScreen(COL_BG);
-  display.endWrite();
-
+// Shared tail for every path into deep sleep: powers down the peripherals
+// and drops the CPU, waking on the next touch. Split out of enterDeepSleep()
+// so the critical-battery path (see enterCriticalBatterySleep()) gets
+// exactly the same power-down sequencing without duplicating it.
+void powerDownAndDeepSleep() {
   // Put the peripherals down before the CPU. Deep sleep only powers down
   // the ESP32 itself — the panel, touch controller and IMU sit on their own
   // rails and keep drawing whatever they were drawing, which on a watch-sized
@@ -996,6 +1093,68 @@ void enterDeepSleep() {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOUCH_INT, 0);
   esp_deep_sleep_start();
   // Never reaches here — the reset vector (setup()) is the only way out.
+}
+
+void enterDeepSleep() {
+  Serial.println("[pipboy] long-press -> entering deep sleep...");
+  saveState(); // catch any steps counted since the last periodic save
+
+  // Say so on screen before going dark. Without this, sleeping looks
+  // identical to a crash or a reboot — and since waking is a full restart,
+  // there's otherwise nothing to distinguish "it slept and woke" from "it
+  // never slept at all".
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.setTextDatum(middle_center);
+  useSharpMedFont();
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString("SLEEP", 120, 112);
+  useSharpSmallFont();
+  display.setTextColor(COL_GREEN, COL_BG);
+  display.drawString("touch to wake", 120, 142);
+  display.endWrite();
+  delay(900);
+
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.endWrite();
+
+  powerDownAndDeepSleep();
+}
+
+// Forces sleep immediately when the cell is critically low — before WiFi,
+// BLE, or (on a sleep wake) the Vault Boy animation get a chance to spend
+// any current, since none of that is worth running at this state of
+// charge. This board has needed a physical battery-connector reconnect to
+// come back once already after running all the way down (see
+// pipboy-watch-battery-reconnect-fix in project memory) — whatever caused
+// that, the actual fix is never letting the cell get that low again, not
+// hoping the recovery works better next time. Shows a brief warning first:
+// a watch that goes dark with no explanation reads as broken, which is
+// exactly the confusion that started this in the first place.
+void enterCriticalBatterySleep(int mv) {
+  Serial.printf("[pipboy] critical battery (%dmV) — sleeping immediately to protect the cell\n", mv);
+
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.setTextDatum(middle_center);
+  useSharpMedFont();
+  display.setTextColor(COL_AMBER, COL_BG);
+  display.drawString("BATTERY LOW", 120, 104);
+  useSharpSmallFont();
+  display.setTextColor(COL_AMBER, COL_BG);
+  display.drawString("charge to continue", 120, 136);
+  char mvbuf[16];
+  snprintf(mvbuf, sizeof(mvbuf), "(%dmV)", mv);
+  display.drawString(mvbuf, 120, 158);
+  display.endWrite();
+  delay(1500); // long enough to actually read before it goes dark again
+
+  display.startWrite();
+  display.fillScreen(COL_BG);
+  display.endWrite();
+
+  powerDownAndDeepSleep();
 }
 
 // Un-dims the backlight and marks the screen for a redraw — shared by every
@@ -1389,17 +1548,24 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
     if (notifs[0].title.length()) banner += banner.length() ? " - " + notifs[0].title : notifs[0].title;
     if (!banner.length()) banner = "NOTIFICATION"; // neither field supplied
     display.setTextColor(COL_GREEN, COL_BG);
-    display.drawString(fitToWidth(banner, 205), 120, 84);
+    display.drawString(fitToWidth(banner, 205), 120, 74);
   } else {
     // Painted over rather than skipped: redraws don't clear the screen, so
     // a dismissed banner would otherwise stay on the panel until something
     // else forced a full repaint.
     display.setTextColor(COL_GREEN, COL_BG);
-    display.drawString("                        ", 120, 84);
+    display.drawString("                        ", 120, 74);
   }
 
   // Time — centered in the middle of the screen, everything else stacks
-  // below it.
+  // below it. The whole block (banner/time/date/weather) was confirmed on
+  // real hardware to run into the fixed BLE/battery cluster at y=213 with
+  // the previous spacing — the weather condition row landed only 13px above
+  // it. Shifted every row here up by another 10px (uniformly, so the
+  // spacing *between* them is unchanged from what wasn't reported as
+  // broken) to open that up to 23px, matching the gap already used on the
+  // WEATHER screen. The cluster itself stays put; it's shared by every
+  // screen.
   int hour12 = t.tm_hour % 12;
   if (hour12 == 0) hour12 = 12;
   char timebuf[16];
@@ -1407,7 +1573,7 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
   display.setTextColor(COL_GREEN, COL_BG);
   display.setFont(&fonts::Font7);
   display.setTextSize(0.85f);
-  display.drawString(timebuf, 120, 118);
+  display.drawString(timebuf, 120, 102);
   display.setTextSize(1.0f);
 
   // Everything below uses a sharp bold monospace face instead of Font7
@@ -1428,17 +1594,32 @@ void drawStatScreen(struct tm &t, int steps, int battPct) {
     snprintf(datebuf, sizeof(datebuf), "-- NO SIGNAL --");
   }
   useSharpRowFont();
-  display.drawString(datebuf, 120, 164);
+  display.drawString(datebuf, 120, 142);
 
   // Current temperature + condition only — the high/low pair lives on the
   // dedicated WEATHER screen, where there's room to label it properly.
+  //
+  // Two rows, not one: squeezing "72°C  scattered clouds" onto a single
+  // line at the row font left barely any width for the condition text, so
+  // anything past one short word got truncated with "...". Splitting them
+  // gives the condition its own row at the full row width and a smaller
+  // font — between the two, real OpenWeatherMap condition strings (almost
+  // always one to three words) should clear it without truncating at all;
+  // fitToWidth stays on as a safety net for the rare one that doesn't.
   if (hasWeather && !weatherTooStale()) {
-    // Yellow to match the WEATHER screen this row summarises.
-    drawTempRow(120, 190, weatherTempC, weatherTxt, COL_YELLOW);
+    // Yellow to match the WEATHER screen this row summarises. Empty
+    // description centers just the temp+ring+C group on its own row.
+    drawTempRow(120, 170, weatherTempC, "", COL_YELLOW);
+    useSharpSmallFont();
+    display.setTextColor(COL_YELLOW, COL_BG);
+    display.drawString(fitToWidth(weatherTxt, 205), 120, 190);
   } else {
-    // Blank the row so a stale reading can't linger between redraws.
+    // Blank both rows so a stale reading can't linger between redraws.
     useSharpRowFont();
-    display.drawString("                    ", 120, 190);
+    display.setTextColor(COL_YELLOW, COL_BG);
+    display.drawString("                    ", 120, 170);
+    useSharpSmallFont();
+    display.drawString("                        ", 120, 190);
   }
 
   drawBleBattCluster(battPct);
@@ -1478,6 +1659,65 @@ void drawDataScreen(int steps, int battPct) {
   display.setTextColor(COL_ORANGE, COL_BG);
   display.drawString(distbuf, 120, 168);
   display.drawString(" tap 4x to reset  ", 120, 188);
+
+  drawBleBattCluster(battPct, COL_ORANGE);
+}
+
+// Bar chart of the past week: the 6 completed days from stepHist plus
+// today's count read live from stepCounter, oldest to newest, left to
+// right. Grouped with DATA (shares its orange accent) since it's really an
+// extension of the same stat rather than its own category.
+void drawHistoryScreen(int battPct) {
+  display.setTextDatum(middle_center);
+
+  useSharpMedFont();
+  display.setTextColor(COL_ORANGE, COL_BG);
+  display.drawString("7-Day Steps", 120, 56);
+
+  uint32_t vals[7];
+  for (uint8_t i = 0; i < 6; i++) vals[i] = stepHist[i];
+  vals[6] = stepCounter.count(); // today, updates live as you walk
+
+  uint32_t maxVal = 1; // floor of 1 avoids a divide-by-zero with no history yet
+  for (uint8_t i = 0; i < 7; i++) if (vals[i] > maxVal) maxVal = vals[i];
+
+  // Bars sit in the round panel's wide middle band — same reasoning as the
+  // boot log's line placement: too near the top/bottom of a 240px circle
+  // and content gets physically cut off by the bezel.
+  const int CHART_TOP = 84, CHART_BOTTOM = 176, CHART_H = CHART_BOTTOM - CHART_TOP;
+  const int BAR_W = 16, BAR_GAP = 6;
+  int totalW = 7 * BAR_W + 6 * BAR_GAP;
+  int x0 = 120 - totalW / 2;
+
+  // Day-of-week labels, oldest to newest, ending on today — computed off
+  // the live clock rather than stored, since only the totals need
+  // persisting. Reads as today's weekday initial if the clock's never been
+  // synced (tm_wday defaults to Thursday, epoch 0), which is cosmetically
+  // wrong but harmless — there's no step history worth labelling yet at
+  // that point anyway.
+  static const char *dowInitial[7] = {"S", "M", "T", "W", "T", "F", "S"};
+  time_t nowEpoch = time(nullptr);
+  struct tm lt;
+  localtime_r(&nowEpoch, &lt);
+
+  useSharpSmallFont();
+  for (uint8_t i = 0; i < 7; i++) {
+    int barH = (int)((uint64_t)vals[i] * CHART_H / maxVal);
+    if (barH < 1 && vals[i] > 0) barH = 1; // a real but tiny day still shows a sliver, not nothing
+    int bx = x0 + i * (BAR_W + BAR_GAP);
+    bool isToday = (i == 6);
+    uint16_t col = isToday ? COL_ORANGE : COL_GREEN_DIM;
+
+    // Clear the whole column first — a day that used to be the tallest bar
+    // and got scaled down since (maxVal grew) would otherwise leave its old
+    // height as a ghost above the new, shorter one.
+    display.fillRect(bx, CHART_TOP, BAR_W, CHART_H, COL_BG);
+    if (barH > 0) display.fillRect(bx, CHART_BOTTOM - barH, BAR_W, barH, col);
+
+    int wday = ((lt.tm_wday - (6 - i)) % 7 + 7) % 7; // negative-safe mod: this bar is (6-i) days before today
+    display.setTextColor(col, COL_BG);
+    display.drawString(dowInitial[wday], bx + BAR_W / 2, CHART_BOTTOM + 12);
+  }
 
   drawBleBattCluster(battPct, COL_ORANGE);
 }
@@ -1710,6 +1950,50 @@ void drawNotifScreen(int battPct) {
   drawBleBattCluster(battPct, COL_BLUE);
 }
 
+// Now-playing, fed by Gadgetbridge's "musicinfo"/"musicstate" messages (see
+// handleGadgetbridgeLine()). Grouped with NOTIF — same blue accent — since
+// both are "things the phone told us" screens. Tapping toggles play/pause
+// via sendMusicControl(), which is flagged there as unverified against a
+// real Gadgetbridge session; the display half of this screen has no such
+// caveat, since it's parsed the same well-established way as weather/notify.
+void drawMusicScreen(int battPct) {
+  display.setTextDatum(middle_center);
+
+  useSharpMedFont();
+  display.setTextColor(COL_BLUE, COL_BG);
+  display.drawString("Now Playing", 120, 66);
+
+  if (!hasMusic) {
+    display.setTextColor(COL_BLUE, COL_BG);
+    display.drawString("-- NOTHING --", 120, 120);
+    useSharpSmallFont();
+    display.drawString("play something on", 120, 148);
+    display.drawString("the phone to see it", 120, 168);
+  } else {
+    useSharpSmallFont();
+    display.setTextColor(COL_BLUE, COL_BG);
+    drawWrapped(musicTrack.length() ? musicTrack : "(unknown track)", 100, 200, 18, 2);
+    display.setTextColor(COL_BLUE, COL_BG);
+    drawWrapped(musicArtist, 140, 200, 18, 1);
+
+    // Play/pause glyph, drawn from primitives the same way the weather
+    // icons are — a filled triangle for "playing", two bars for "paused".
+    display.setTextColor(COL_BLUE, COL_BG);
+    int cx = 120, cy = 178, s = 16;
+    if (musicPlaying) {
+      display.fillTriangle(cx - s / 2, cy - s / 2, cx - s / 2, cy + s / 2, cx + s / 2, cy, COL_BLUE);
+    } else {
+      display.fillRect(cx - s / 2, cy - s / 2, s / 3, s, COL_BLUE);
+      display.fillRect(cx + s / 6, cy - s / 2, s / 3, s, COL_BLUE);
+    }
+
+    display.setTextColor(COL_GREEN_DIM, COL_BG);
+    display.drawString("tap: play / pause", 120, 198);
+  }
+
+  drawBleBattCluster(battPct, COL_BLUE);
+}
+
 // Vault Boy, traced from a real reference photo down to a 1bpp bitmap (see
 // vaultboy_bitmap.h) rather than freehand-drawn — this is what actually
 // gets the proportions and pose right. Rendered as a green silhouette with
@@ -1786,6 +2070,13 @@ void playBootAnimation() {
   delay(400);
 }
 
+// Solid full-brightness fill — see SCREEN_FLASHLIGHT. No BLE/battery
+// cluster drawn over it (render() skips the cluster for this screen): the
+// point is raw light output, and it would only cut into that.
+void drawFlashlightScreen() {
+  display.fillScreen(COL_WHITE);
+}
+
 void render(bool fullClear) {
   display.startWrite();
   if (fullClear) {
@@ -1800,10 +2091,14 @@ void render(bool fullClear) {
 
   if (currentScreen == SCREEN_STAT) drawStatScreen(t, steps, battPct);
   else if (currentScreen == SCREEN_DATA) drawDataScreen(steps, battPct);
+  else if (currentScreen == SCREEN_HISTORY) drawHistoryScreen(battPct);
   else if (currentScreen == SCREEN_WEATHER) drawWeatherScreen(battPct);
   else if (currentScreen == SCREEN_NOTIF) drawNotifScreen(battPct);
+  else if (currentScreen == SCREEN_MUSIC) drawMusicScreen(battPct);
   else if (currentScreen == SCREEN_STOPWATCH) drawStopwatchScreen(battPct);
-  else drawTimerScreen(battPct);
+  else if (currentScreen == SCREEN_TIMER) drawTimerScreen(battPct);
+  else drawFlashlightScreen(); // SCREEN_FLASHLIGHT
+
   display.endWrite();
 }
 
@@ -1844,6 +2139,7 @@ void setup() {
   display.setRotation(1); // 90° clockwise
   display.setBrightness(BRIGHT_ACTIVE);
   lastActivityMs = millis();
+  nextFlickerMs = lastActivityMs + 4000 + random(4000); // first CRT flicker blip, not an instant one
 
   // The boot terminal is skipped entirely on a sleep wake — there it would
   // just be a delay between "touched the watch" and "screen shows
@@ -1908,6 +2204,20 @@ void setup() {
 
   loadState();
   timerLoad(timerPresetIdx); // arm the default duration so the screen has something to show
+
+  // Critical-battery check, before spending any current on WiFi, BLE, or
+  // (on a sleep wake) the Vault Boy animation — none of that is worth
+  // running at this state of charge, and skipping it here is what actually
+  // keeps the cell from ever reaching the danger zone this board has
+  // needed a physical reconnect to recover from once already. A reading
+  // outside the plausible range is BATT_UNKNOWN, not "critical" — that
+  // could just mean no cell is installed (e.g. bench-testing on USB alone),
+  // which isn't a low-battery situation at all.
+  int battMv = readBatteryMilliVolts();
+  if (battMv >= BATT_MIN_PLAUSIBLE_MV && battMv <= BATT_CRITICAL_MV) {
+    enterCriticalBatterySleep(battMv); // never returns
+  }
+
   if (!wokeFromSleep) bootLog("> bluetooth up");
   setupBLE();
 
@@ -1926,7 +2236,7 @@ void setup() {
     // indefinitely. This still skips WiFi entirely on the common case (a
     // quick glance well within the interval), which is the whole point of
     // the fast-wake path — it just no longer skips it *forever*.
-    if (wifiResyncDue()) {
+    if (wifiResyncDue(WAKE_RESYNC_INTERVAL_SEC)) {
       Serial.println("[pipboy] wake: resync due, trying a quick WiFi reconnect...");
       rtcLastSyncAttemptEpoch = time(nullptr); // stamp before attempting — throttles retries even on failure
       bool resynced = syncTimeViaWifi(8000);   // saved creds only, no portal — same as loop()'s periodic resync
@@ -1935,6 +2245,15 @@ void setup() {
       wifiOk = timeSynced;
       Serial.println("[pipboy] wake: recently synced, skipping WiFi.");
     }
+
+    // Vault Boy on every wake now, not just cold boot — costs the ~0.85s
+    // playBootAnimation() takes (five flicker steps plus a settle delay),
+    // which is a real, deliberate cost against the fast-wake path's whole
+    // point, but that's the trade asked for: waking should feel like the
+    // watch turning on, not just the screen un-dimming. The scanning-log
+    // lines above this stay cold-boot-only, though — those exist to narrate
+    // WiFi/NTP/sensor probing, which this path mostly skips anyway.
+    playBootAnimation();
   } else {
     bootLog("> wifi connect...");
     wifiOk = wifiConnectOrSetup();
@@ -2004,8 +2323,11 @@ void loop() {
     localtime_r(&nowEpoch, &lt);
     uint32_t today = (uint32_t)((lt.tm_year + 1900) * 10000u + (lt.tm_mon + 1) * 100u + lt.tm_mday);
     if (lastDayMarker != 0 && today != lastDayMarker) {
-      Serial.printf("[pipboy] new day (%lu -> %lu), resetting steps\n",
-                    (unsigned long)lastDayMarker, (unsigned long)today);
+      uint32_t finished = stepCounter.count(); // the day that's ending, before it's wiped
+      for (uint8_t i = 0; i + 1 < 6; i++) stepHist[i] = stepHist[i + 1]; // drop the oldest
+      stepHist[5] = finished; // most recently completed day, for the HISTORY screen
+      Serial.printf("[pipboy] new day (%lu -> %lu), resetting steps (yesterday: %lu)\n",
+                    (unsigned long)lastDayMarker, (unsigned long)today, (unsigned long)finished);
       stepCounter.set(0);
       lastDayMarker = today;
       saveState(); // persist immediately so a reboot can't resurrect yesterday's count
@@ -2150,6 +2472,16 @@ void loop() {
           }
           forceRedraw = true;
 
+        } else if (tapGesture && currentScreen == SCREEN_MUSIC && hasMusic) {
+          sendMusicControl(musicPlaying ? "pause" : "play");
+          // Flip the local flag optimistically rather than waiting for a
+          // musicstate echo back — Gadgetbridge doesn't reliably send one
+          // for a command the watch itself issued, and a button that
+          // doesn't visibly respond to its own tap reads as broken even
+          // when the phone-side command worked fine.
+          musicPlaying = !musicPlaying;
+          forceRedraw = true;
+
         } else
 
         // A touch that woke the dimmed screen is barred from *navigating*
@@ -2211,20 +2543,48 @@ void loop() {
     forceRedraw = true;
   }
 
+  // Flashlight: full brightness for as long as that screen is up, restored
+  // to whatever brightness applied before (active or already-dimmed) the
+  // moment you swipe away. Tracked by transition rather than just "if
+  // showing, set 255 every loop" so it doesn't fight the dim/flicker logic
+  // below for control of the backlight while it's not actually in use.
+  bool isFlashlightNow = (currentScreen == SCREEN_FLASHLIGHT);
+  if (isFlashlightNow && !wasFlashlightScreen) {
+    display.setBrightness(255); // brighter than the normal BRIGHT_ACTIVE ceiling — this is a torch
+  } else if (!isFlashlightNow && wasFlashlightScreen) {
+    display.setBrightness(backlightDimmed ? BRIGHT_DIM : BRIGHT_ACTIVE);
+  }
+  wasFlashlightScreen = isFlashlightNow;
+
   // Dim the backlight after a few seconds of no touch — it's the single
   // biggest power draw on this board, and a watch face doesn't need to
-  // stay at full brightness when nobody's looking at it.
-  if (touchOk && !backlightDimmed && now - lastActivityMs > IDLE_DIM_TIMEOUT_MS) {
+  // stay at full brightness when nobody's looking at it. Held off on the
+  // flashlight screen for the obvious reason.
+  if (touchOk && !backlightDimmed && !isFlashlightNow && now - lastActivityMs > IDLE_DIM_TIMEOUT_MS) {
     display.setBrightness(BRIGHT_DIM);
     backlightDimmed = true;
+  }
+
+  // A faint CRT power-flicker blip, purely cosmetic: a brief brightness dip
+  // and recovery at a random interval, while there's an active, undimmed
+  // screen to see it on. Skipped on the flashlight screen for the same
+  // reason the idle-dim is — and skipped while dimmed both because it'd be
+  // barely visible at BRIGHT_DIM and because there'd be nothing watching it
+  // happen anyway.
+  if (!backlightDimmed && !isFlashlightNow && now >= nextFlickerMs) {
+    display.setBrightness(BRIGHT_ACTIVE > 40 ? BRIGHT_ACTIVE - 40 : BRIGHT_ACTIVE / 2);
+    delay(30);
+    display.setBrightness(BRIGHT_ACTIVE);
+    nextFlickerMs = now + 4000 + random(4000); // next one due 4-8s from now
   }
 
   // Sleep the whole watch after a long stretch untouched. Held off while a
   // stopwatch or timer is counting: deep sleep is a full reset, so sleeping
   // through a running timer would silently destroy it and the alarm would
   // never fire — the one case where "nobody has touched it" plainly does
-  // not mean "nothing is happening".
-  if (touchOk && AUTO_SLEEP_TIMEOUT_MS && !swRunning && !timerRunning &&
+  // not mean "nothing is happening". Held off on the flashlight screen too:
+  // falling asleep mid-use would be a strange way for a torch to behave.
+  if (touchOk && AUTO_SLEEP_TIMEOUT_MS && !swRunning && !timerRunning && !isFlashlightNow &&
       now - lastActivityMs > AUTO_SLEEP_TIMEOUT_MS) {
     Serial.println("[pipboy] idle timeout -> deep sleep");
     enterDeepSleep(); // never returns
