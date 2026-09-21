@@ -1687,11 +1687,10 @@ void onScreenGesture(lv_event_t *e) {
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
 
-  if (dir == LV_DIR_BOTTOM && currentScreen == SCREEN_STAT) {
-    // The one navigation gesture left: a downward swipe on the clock face
-    // pulls settings down. Kept as a gesture rather than a seventh nav
-    // badge so the ring's spacing stays as-is. Flip to LV_DIR_TOP if it
-    // turns out to read backwards on the panel.
+  if (dir == LV_DIR_TOP && currentScreen == SCREEN_STAT) {
+    // The one navigation gesture left: swiping up on the clock face brings
+    // settings up. Kept as a gesture rather than a seventh nav badge so the
+    // ring's spacing stays as-is.
     goToScreen(SCREEN_SETTINGS);
 
   } else if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
@@ -2638,6 +2637,24 @@ void on24hToggle(lv_event_t *e) {
   saveSettings();
 }
 
+// Find my phone — makes the *phone* ring; nothing is needed on the watch
+// side beyond sending the message, which is why this works despite the
+// board having no speaker of its own. Format confirmed against Espruino's
+// Gadgetbridge protocol docs: {"t":"findPhone","n":true} starts it,
+// n:false stops it. The button toggles between the two so the same control
+// can call it off.
+bool findPhoneRinging = false;
+lv_obj_t *setFindPhoneLbl;
+
+void onFindPhone(lv_event_t *e) {
+  noteTouchActivity();
+  findPhoneRinging = !findPhoneRinging;
+  char buf[48];
+  snprintf(buf, sizeof(buf), "{\"t\":\"findPhone\",\"n\":%s}", findPhoneRinging ? "true" : "false");
+  sendGadgetbridgeLine(buf);
+  if (setFindPhoneLbl) lv_label_set_text(setFindPhoneLbl, findPhoneRinging ? "Stop" : "Ring");
+}
+
 // One row of the settings list: a label on the left, caller's control on
 // the right. Returns the row so the caller can parent its control to it.
 lv_obj_t *makeSettingsRow(lv_obj_t *parent, const char *label, lv_color_t accent) {
@@ -2739,6 +2756,23 @@ void buildSettingsScreen() {
   lv_obj_set_style_bg_color(set24hSw, accent, LV_PART_INDICATOR | LV_STATE_CHECKED);
   lv_obj_add_event_cb(set24hSw, on24hToggle, LV_EVENT_VALUE_CHANGED, NULL);
   if (cfgTime24h) lv_obj_add_state(set24hSw, LV_STATE_CHECKED);
+
+  row = makeSettingsRow(list, "Find phone", accent);
+  lv_obj_t *fpBtn = lv_button_create(row);
+  lv_obj_set_size(fpBtn, 74, 26);
+  lv_obj_set_style_radius(fpBtn, 13, 0);
+  lv_obj_set_style_bg_color(fpBtn, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(fpBtn, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_color(fpBtn, accent, 0);
+  lv_obj_set_style_border_width(fpBtn, 1, 0);
+  lv_obj_set_style_shadow_width(fpBtn, 0, 0);
+  lv_obj_set_style_bg_color(fpBtn, accent, LV_STATE_PRESSED);
+  lv_obj_add_event_cb(fpBtn, onFindPhone, LV_EVENT_CLICKED, NULL);
+  setFindPhoneLbl = lv_label_create(fpBtn);
+  lv_obj_set_style_text_font(setFindPhoneLbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(setFindPhoneLbl, lv_color_white(), 0);
+  lv_label_set_text(setFindPhoneLbl, findPhoneRinging ? "Stop" : "Ring");
+  lv_obj_center(setFindPhoneLbl);
 
   settingsRefreshValues();
 
@@ -2871,10 +2905,19 @@ void buildBootScreen() {
   lv_timer_handler(); // pump once so this initial paint actually reaches the panel
 }
 
+// Per-step pacing for updateBootStatus(). A cold boot holds each step long
+// enough to actually read as it goes by (the pacing the old bootLog() used);
+// a sleep-wake sets this to 0 so the bar tracks the real work and nothing
+// else — see setup().
+uint16_t bootStepDelayMs = 110;
+
 // Advances the status line and lights up progress segments proportional to
-// `step` out of BOOT_TOTAL_STEPS. Not called at all on a sleep-wake (see
-// setup()'s wokeFromSleep guards, same spirit as the old bootLog() ones) —
-// that path is meant to feel instant, not narrate what it's doing.
+// `step` out of BOOT_TOTAL_STEPS. This runs on the sleep-wake path too:
+// that path skipped it entirely before, which left the bar sitting
+// completely unlit for the whole wake (I2C scan, touch, IMU, BLE, and
+// sometimes an 8s WiFi resync) and read as a broken progress bar rather
+// than a fast one. Pacing, not the bar itself, is what makes a wake feel
+// instant, so bootStepDelayMs is what the wake path drops.
 void updateBootStatus(const char *status, uint8_t step) {
   Serial.printf("[pipboy] %s\n", status);
   lv_label_set_text(bootStatus, status);
@@ -2884,7 +2927,7 @@ void updateBootStatus(const char *status, uint8_t step) {
     lv_obj_set_style_bg_color(bootSegments[i], i < lit ? lv_color_hex(0x55FF6E) : lv_color_hex(0x193B2A), 0);
   }
   lv_timer_handler();
-  delay(110); // same "long enough to actually read as it goes by" pacing bootLog() used
+  if (bootStepDelayMs) delay(bootStepDelayMs);
 }
 
 // Vault Boy's power-on flicker reveal — same flicker character as before
@@ -2956,15 +2999,17 @@ void setup() {
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, lvglTouchRead);
 
+  // A wake runs the same progress bar, just without the per-step dwell.
+  if (wokeFromSleep) bootStepDelayMs = 0;
+
   buildBootScreen();
-  if (!wokeFromSleep) updateBootStatus("INITIALIZING...", 1);
-  else lv_timer_handler(); // still pump once so the boot screen's first paint actually reaches the panel
+  updateBootStatus("INITIALIZING...", 1);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(400000);
   Wire.setTimeOut(50);
 
-  if (!wokeFromSleep) updateBootStatus("SCANNING BUS...", 2);
+  updateBootStatus("SCANNING BUS...", 2);
   for (uint8_t addr = 0x08; addr < 0x78; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
@@ -2972,14 +3017,14 @@ void setup() {
     }
   }
 
-  if (!wokeFromSleep) updateBootStatus("TOUCH CALIBRATION...", 3);
+  updateBootStatus("TOUCH CALIBRATION...", 3);
   for (int attempt = 1; attempt <= 4 && !touchOk; attempt++) {
     touchOk = touch.begin(Wire, PIN_TOUCH_RST, PIN_TOUCH_INT);
     Serial.printf("[pipboy] touch.begin() attempt %d -> %d\n", attempt, touchOk);
     if (!touchOk) delay(150);
   }
 
-  if (!wokeFromSleep) updateBootStatus("MOTION CALIBRATION...", 4);
+  updateBootStatus("MOTION CALIBRATION...", 4);
   Serial.println("[pipboy] probing IMU...");
   imuOk = imu.begin(Wire, QMI8658_ADDRESS_HIGH) || imu.begin(Wire, QMI8658_ADDRESS_LOW);
   Serial.printf("[pipboy] imu.begin() -> %d\n", imuOk);
@@ -3003,7 +3048,7 @@ void setup() {
     enterCriticalBatterySleep(battMv); // never returns
   }
 
-  if (!wokeFromSleep) updateBootStatus("BLE UPLINK...", 5);
+  updateBootStatus("BLE UPLINK...", 5);
   setupBLE();
 
   bool wifiOk;
@@ -3011,6 +3056,7 @@ void setup() {
     timeSynced = (time(nullptr) > 1700000000);
     if (wifiResyncDue(WAKE_RESYNC_INTERVAL_SEC)) {
       Serial.println("[pipboy] wake: resync due, trying a quick WiFi reconnect...");
+      updateBootStatus("TIME SYNC...", 5); // the slow step on this path — hold the bar just short of full
       rtcLastSyncAttemptEpoch = time(nullptr);
       bool resynced = syncTimeViaWifi(8000);
       wifiOk = resynced || timeSynced;
@@ -3018,6 +3064,7 @@ void setup() {
       wifiOk = timeSynced;
       Serial.println("[pipboy] wake: recently synced, skipping WiFi.");
     }
+    updateBootStatus(wifiOk ? "UPLINK ESTABLISHED" : "OFFLINE MODE", 6);
     playBootAnimation();
   } else {
     updateBootStatus("TIME SYNC...", 6);
