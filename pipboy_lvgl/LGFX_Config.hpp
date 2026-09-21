@@ -19,7 +19,14 @@ public:
       auto cfg = _bus_instance.config();
       cfg.spi_host = SPI2_HOST;
       cfg.spi_mode = 0;
-      cfg.freq_write = 40000000;
+      // 80MHz: the GC9A01 is rated well past this and Waveshare's own
+      // driver for this board runs it here. Raised from 40MHz when the melt
+      // transition turned out to be SPI-bound — a full 240x240 RGB565 frame
+      // is 115KB, which is 23ms at 40MHz and ~11ms here, and the melt pushes
+      // one of those per frame. Every other redraw got cheaper too.
+      // Verified on hardware: if the panel ever shows tearing, speckle or
+      // shifted pixels, this is the first thing to put back to 40000000.
+      cfg.freq_write = 80000000;
       cfg.freq_read  = 16000000;
       cfg.spi_3wire  = false;
       cfg.use_lock   = true;

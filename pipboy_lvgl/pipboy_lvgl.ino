@@ -1498,20 +1498,162 @@ void lvglTouchRead(lv_indev_t *indev, lv_indev_data_t *data) {
   }
 }
 
+// ---------- Screen melt transition ----------
+// LVGL ships eight slide variants plus a fade and nothing else; there is no
+// hook for a per-column effect, so this one is hand-rolled. It's the 1993
+// Doom screen melt: the outgoing screen sags away in ragged vertical strips
+// to reveal the next one behind it. That reads far more like a CRT losing
+// its picture than a slide does, which is the right register for a Pip-Boy.
+//
+// Building it out of LVGL objects (snapshot the screen, slice it into 20
+// image widgets, animate each one down) was the obvious route and is the
+// wrong one: every frame would dirty the whole screen and drag the entire
+// compositor — scanline overlay included — through a full recomposite.
+// Instead both screens are snapshotted to PSRAM once up front, and the melt
+// frames are composed here and pushed straight at the panel, bypassing LVGL
+// entirely for the ~0.3s it runs. SPI bandwidth is then the only real cost.
+static const uint8_t MELT_COLS = 20;            // 240 / 20 = 12px strips
+static const uint8_t MELT_COL_W = 240 / MELT_COLS;
+static const uint8_t MELT_BLOCK_ROWS = 40;      // rows composed per SPI push
+static const uint8_t MELT_MAX_STEP = 40;        // px/frame a strip settles at
+static const uint8_t MELT_MAX_HEADSTART = 8;    // frames a strip can lag by
+
+uint16_t *meltOldPx = nullptr;
+uint16_t *meltNewPx = nullptr;
+lv_draw_buf_t meltOldBuf;
+lv_draw_buf_t meltNewBuf;
+bool meltReady = false;
+// Composed in internal DRAM rather than PSRAM: this is the buffer the panel
+// DMAs out of, and it's re-filled between pushes, so it stays small and gets
+// a waitDMA() before each reuse.
+static uint16_t meltBlock[240 * MELT_BLOCK_ROWS];
+
+// Two full-screen RGB565 snapshots, 115KB each — PSRAM only, there is no
+// room for them in internal DRAM. A failure here isn't fatal: meltReady
+// stays false and goToScreen() falls back to the stock slides.
+void initMelt() {
+  size_t bytes = (size_t)240 * 240 * 2;
+  meltOldPx = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+  meltNewPx = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+  if (!meltOldPx || !meltNewPx) {
+    Serial.println("[pipboy] melt: PSRAM alloc failed, using slide transitions");
+    if (meltOldPx) { heap_caps_free(meltOldPx); meltOldPx = nullptr; }
+    if (meltNewPx) { heap_caps_free(meltNewPx); meltNewPx = nullptr; }
+    return;
+  }
+  lv_draw_buf_init(&meltOldBuf, 240, 240, LV_COLOR_FORMAT_RGB565, 240 * 2, meltOldPx, bytes);
+  lv_draw_buf_init(&meltNewBuf, 240, 240, LV_COLOR_FORMAT_RGB565, 240 * 2, meltNewPx, bytes);
+  meltReady = true;
+  Serial.printf("[pipboy] melt: 2x%u bytes in PSRAM, %u free\n",
+                (unsigned)bytes, (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+// One melt frame: for every output row, each strip shows either the new
+// screen (above that strip's fallen edge) or the old screen shifted down by
+// it. Composed a block of rows at a time so the DMA source stays small.
+void meltPushFrame(const int16_t *colY) {
+  display.startWrite();
+  display.setAddrWindow(0, 0, 240, 240);
+  for (uint16_t base = 0; base < 240; base += MELT_BLOCK_ROWS) {
+    for (uint8_t r = 0; r < MELT_BLOCK_ROWS; r++) {
+      uint16_t row = base + r;
+      uint16_t *dst = meltBlock + (uint32_t)r * 240;
+      for (uint8_t c = 0; c < MELT_COLS; c++) {
+        uint16_t x = (uint16_t)c * MELT_COL_W;
+        // row - colY[c] can't reach 240: colY[c] <= 240 and row <= 239, so
+        // a strip that has fallen clean off is simply all-new-screen here.
+        const uint16_t *src = (row < colY[c]) ? (meltNewPx + (uint32_t)row * 240)
+                                              : (meltOldPx + (uint32_t)(row - colY[c]) * 240);
+        memcpy(dst + x, src + x, MELT_COL_W * 2);
+      }
+    }
+    display.writePixels(reinterpret_cast<lgfx::rgb565_t *>(meltBlock), 240 * MELT_BLOCK_ROWS);
+    display.waitDMA(); // meltBlock is about to be refilled under the DMA
+  }
+  display.endWrite();
+}
+
+// Runs the melt from whatever is on the panel now to `next`, then leaves the
+// panel showing `next` exactly. Returns false if it couldn't snapshot, in
+// which case nothing has been drawn and the caller should slide instead.
+// Pass captureOld=false when meltOldBuf already holds the outgoing image —
+// the boot screen is snapshotted early, before it and its 73KB Vault Boy
+// sprite are freed to make room for the real screens.
+bool playMelt(lv_obj_t *next, bool captureOld) {
+  if (!meltReady) return false;
+  if (captureOld &&
+      lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, &meltOldBuf) != LV_RESULT_OK)
+    return false;
+  lv_screen_load(next); // instant: nothing reaches the panel until we push it
+  if (lv_snapshot_take_to_draw_buf(next, LV_COLOR_FORMAT_RGB565, &meltNewBuf) != LV_RESULT_OK)
+    return false;
+
+  // Doom's own seeding, and the reason the edge looks like sagging wax
+  // rather than noise: each strip starts within one pixel of its neighbour,
+  // so the row of start offsets is a random *walk*, not independent draws.
+  int16_t colY[MELT_COLS];
+  colY[0] = -(int16_t)random(0, MELT_MAX_HEADSTART + 1);
+  for (uint8_t c = 1; c < MELT_COLS; c++) {
+    colY[c] = colY[c - 1] + (int16_t)random(-1, 2);
+    if (colY[c] > 0) colY[c] = 0;
+    if (colY[c] < -MELT_MAX_HEADSTART) colY[c] = -MELT_MAX_HEADSTART;
+  }
+
+  uint32_t startMs = millis();
+  uint16_t frames = 0;
+  bool moving = true;
+  while (moving) {
+    moving = false;
+    for (uint8_t c = 0; c < MELT_COLS; c++) {
+      if (colY[c] < 0) {            // still waiting its turn to let go
+        colY[c]++;
+        moving = true;
+      } else if (colY[c] < 240) {
+        // Accelerate out of the start so strips peel rather than jump, then
+        // hold a constant fall speed — Doom's shape, but steepened: its
+        // dy=y+1 ramp is paced for a 35fps software renderer, and over SPI
+        // at this size that would be ~30 frames and near a second per
+        // transition. This clears 240px in about ten.
+        int16_t dy = colY[c] / 2 + 4;
+        if (dy > MELT_MAX_STEP) dy = MELT_MAX_STEP;
+        if (colY[c] + dy > 240) dy = 240 - colY[c];
+        colY[c] += dy;
+        moving = true;
+      }
+    }
+    meltPushFrame(colY);
+    frames++;
+  }
+  Serial.printf("[pipboy] melt: %u frames in %lums\n", frames, (unsigned long)(millis() - startMs));
+  return true;
+}
+
 // Switches the visible screen and keeps currentScreen (still used all over
 // — auto-sleep exclusion, BLE popup targeting, etc.) in sync with it.
-// Screens slide rather than cutting straight over: an instant swap reads
-// as the display glitching, especially with a whole screen's worth of
-// content changing at once. Direction carries meaning — going *into* a
-// section drops the new screen down from the top, going back up to the
-// clock slides away upward — so the motion says which way you moved
-// through the UI rather than just being decoration.
+// Screens never cut straight over: an instant swap reads as the display
+// glitching, especially with a whole screen's worth of content changing at
+// once. The melt is the house style; the slides below are the fallback for
+// when PSRAM couldn't be had, and there direction still carries meaning —
+// sections drop down from the top, the clock slides back up, and settings
+// sits *below* the clock so it rises from the bottom to match its swipe.
 void goToScreen(uint8_t idx) {
   if (idx >= NUM_SCREENS) return;
-  lv_scr_load_anim_t anim = (idx == SCREEN_STAT) ? LV_SCR_LOAD_ANIM_MOVE_TOP : LV_SCR_LOAD_ANIM_MOVE_BOTTOM;
+  uint8_t from = currentScreen;
   currentScreen = idx;
-  lv_screen_load_anim(screens[idx], anim, 220, 0, false);
   forceRedraw = true;
+
+  // Snapshot the outgoing screen only once the incoming one holds current
+  // content — otherwise the melt reveals a screen a second out of date.
+  refreshAllScreens();
+
+  if (playMelt(screens[idx], true)) return;
+
+  lv_scr_load_anim_t anim;
+  if (idx == SCREEN_SETTINGS)      anim = LV_SCR_LOAD_ANIM_MOVE_TOP;    // rises from the bottom
+  else if (from == SCREEN_SETTINGS) anim = LV_SCR_LOAD_ANIM_MOVE_BOTTOM; // drops back down
+  else if (idx == SCREEN_STAT)      anim = LV_SCR_LOAD_ANIM_MOVE_TOP;
+  else                              anim = LV_SCR_LOAD_ANIM_MOVE_BOTTOM;
+  lv_screen_load_anim(screens[idx], anim, 220, 0, false);
 }
 
 // ---------- CRT scanline overlay ----------
@@ -2999,6 +3141,9 @@ void setup() {
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, lvglTouchRead);
 
+  // Before the boot screen, so the boot screen itself can be melted out of.
+  initMelt();
+
   // A wake runs the same progress bar, just without the per-step dwell.
   if (wokeFromSleep) bootStepDelayMs = 0;
 
@@ -3075,6 +3220,13 @@ void setup() {
     playBootAnimation();
   }
 
+  // Grab the boot screen before it goes, so the watch face can melt out of
+  // Vault Boy rather than blinking into place. Has to happen here: the
+  // snapshot needs bootScreen and its sprite still alive, but they have to
+  // be freed before the real screens are built.
+  bool meltFromBoot = meltReady &&
+      lv_snapshot_take_to_draw_buf(bootScreen, LV_COLOR_FORMAT_RGB565, &meltOldBuf) == LV_RESULT_OK;
+
   // Boot screen's done its job — free it (and the sprite buffer behind
   // it, ~73KB, worth reclaiming since nothing needs Vault Boy again until
   // the next boot) before building the real 9-screen UI.
@@ -3103,8 +3255,10 @@ void setup() {
   }
 
   refreshAllScreens();
-  lv_screen_load(screens[SCREEN_STAT]);
   currentScreen = SCREEN_STAT;
+  if (!meltFromBoot || !playMelt(screens[SCREEN_STAT], false)) {
+    lv_screen_load(screens[SCREEN_STAT]);
+  }
 
   if (!wokeFromSleep) delay(200);
   Serial.println("[pipboy] PIP-BOY 3000 online (LVGL).");

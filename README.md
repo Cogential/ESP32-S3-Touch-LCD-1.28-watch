@@ -210,11 +210,46 @@ request — `pipboy_watch/` still has both if either needs reviving.
 carries a ring of six round nav badges on a ±100° arc across the top
 (spacing derived from the geometry: 40px badges need ≥42px between
 centres, so a 200° span at r=92 puts them ~63px apart), and every other
-screen has an identical back button at bottom centre. Screens slide in on
-a 220ms animation — down when entering a section, up when going back — so
-the direction indicates which way you moved rather than the display
-appearing to glitch. The only surviving gesture is the stopwatch's
-swipe-to-clear, which was never screen-to-screen navigation.
+screen has an identical back button at bottom centre. Swiping up on the
+clock face opens SETTINGS, which is deliberately not in the nav ring.
+Screens change with the **melt transition** described below. The only other
+surviving gesture is the stopwatch's swipe-to-clear, which was never
+screen-to-screen navigation.
+
+**Screen melt transition** (`playMelt()`): LVGL ships eight slide variants
+and a fade, with no hook for anything per-column, so this is hand-rolled —
+the 1993 Doom screen melt, where the outgoing screen sags away in ragged
+vertical strips to reveal the next one behind it. Doom's column-seeding is
+reproduced exactly (each strip's start offset is a random *walk* from its
+neighbour's, which is what makes the edge read as sagging wax instead of
+noise); the fall ramp is steepened, since Doom's pacing assumed a 35fps
+software renderer and would put a transition near a full second here.
+
+The implementation deliberately avoids LVGL: doing it as 20 animated image
+widgets would dirty the whole screen every frame and drag the entire
+compositor — scanline overlay included — through a full recomposite. Both
+screens are instead snapshotted to PSRAM once (`lv_snapshot_take_to_draw_buf`,
+115KB each), and frames are composed and pushed straight at the panel,
+bypassing LVGL for the ~0.35s it runs. Two consequences worth knowing:
+
+- **PSRAM is now enabled** (`PSRAM=enabled` in the FQBN). The ESP32-S3R2
+  here has 2MB of embedded quad PSRAM — confirmed with `esptool chip-id`,
+  not assumed. It claims GPIO 35-37, which nothing on this board uses.
+  If allocation ever fails, `meltReady` stays false and `goToScreen()`
+  falls back to the stock slides, which still encode direction (sections
+  drop from the top, the clock slides back up, settings rises from the
+  bottom to match its swipe).
+- **SPI was raised 40MHz → 80MHz.** The melt is bandwidth-bound: one
+  115KB frame is 23ms at 40MHz and ~11ms at 80MHz. Measured on hardware,
+  this took a transition from ~600ms to ~350ms (≈19 frames at ~20ms).
+  Every other redraw got cheaper too. **If the panel ever shows tearing,
+  speckle or shifted pixels, `freq_write` in `LGFX_Config.hpp` is the
+  first thing to put back.**
+
+The boot screen melts into the watch face for the same reason — it needs
+the snapshot taken before Vault Boy's 73KB sprite is freed, which is why
+`initMelt()` runs up with the LVGL display setup rather than beside the
+other screen builders.
 
 **Per-section colours**: clock/steps green, history orange, weather
 yellow, notifications blue, music purple, stopwatch red. Each section's

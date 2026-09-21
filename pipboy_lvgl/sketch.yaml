@@ -6,7 +6,13 @@ profiles:
     # without an explicit FlashSize, the bootloader's own flash-size field
     # stays at 4MB regardless of the partition table, and boot-loops the
     # board against the real 16MB chip.
-    fqbn: esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M
+    fqbn: esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled
+    # PSRAM=enabled: the ESP32-S3R2 on this board has 2MB of embedded quad
+    # PSRAM (confirmed with `esptool chip-id`, which reports "Embedded PSRAM
+    # 2MB (AP_3v3)"). It was left off until the melt transition needed two
+    # 115KB full-screen snapshots, which internal DRAM has no room for.
+    # Quad PSRAM claims GPIO 35-37; nothing here uses them (panel is on
+    # 2/8-12/14, touch and IMU on 5/6/7/13), so enabling it is free.
     platforms:
       - platform: esp32:esp32 (3.3.11)
         platform_index_url: https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
