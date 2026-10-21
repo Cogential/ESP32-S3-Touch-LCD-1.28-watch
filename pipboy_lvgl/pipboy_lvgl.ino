@@ -393,7 +393,15 @@ static const char *NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 BLEServer *bleServer = nullptr;
 BLECharacteristic *stepsChar = nullptr;
 BLEAdvertising *bleAdvertising = nullptr;
+// Raw bytes from the NUS RX characteristic, appended on the BLE task and
+// drained (split into lines and parsed) on the loop task by
+// drainGadgetbridgeRx(). Parsing must stay on the loop task: it rewrites
+// notifs[], the music/weather strings and the current screen, all of which
+// loop() reads while handing them to LVGL — doing it from the BLE callback
+// freed Strings LVGL was mid-way through copying. The mutex guards only
+// this buffer.
 String nusRxBuffer = "";
+SemaphoreHandle_t nusRxMutex = nullptr;
 // TX is now also used for music control (see sendMusicControl()), so unlike
 // the other characteristics it needs to outlive setupBLE()'s local scope.
 BLECharacteristic *nusTxChar = nullptr;
@@ -530,10 +538,10 @@ void handleGadgetbridgeLine(const String &line) {
     // showing the one that just arrived rather than wherever the list was
     // last scrolled to.
     notifIndex = 0;
-    currentScreen = SCREEN_NOTIF;
-    notifAutoShown = true;
-    notifAutoRevertMs = millis() + 8000;
     wakeScreen(millis());
+    goToScreen(SCREEN_NOTIF); // already there: just refreshes
+    notifAutoShown = true;
+    notifAutoRevertMs = millis() + 8000; // stamped after the melt, which blocks ~350ms
 
   } else if (strcmp(type, "notify-") == 0) {
     // Dismissed on the phone. Matching on id is what keeps the watch's list
@@ -611,23 +619,41 @@ void handleGadgetbridgeLine(const String &line) {
   // Other message types (notify-, findPhone, etc.) are ignored for now.
 }
 
+// Runs on the BLE task: only queue the bytes, see nusRxBuffer.
 class NUSRxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
     String chunk = c->getValue();
+    xSemaphoreTake(nusRxMutex, portMAX_DELAY);
     nusRxBuffer += chunk;
-
-    int nl;
-    while ((nl = nusRxBuffer.indexOf('\n')) >= 0) {
-      String line = nusRxBuffer.substring(0, nl);
-      nusRxBuffer = nusRxBuffer.substring(nl + 1);
-      handleGadgetbridgeLine(line);
-    }
-    // Guard against a runaway buffer if we somehow never see a newline.
-    if (nusRxBuffer.length() > 2048) nusRxBuffer = "";
+    // Guard against a runaway buffer (no newline ever, or loop() stalled).
+    if (nusRxBuffer.length() > 8192) nusRxBuffer = "";
+    xSemaphoreGive(nusRxMutex);
   }
 };
 
+// Called from loop(): takes every complete line queued by NUSRxCallbacks
+// and parses it here on the loop task. A trailing partial line stays queued
+// for the next chunk.
+void drainGadgetbridgeRx() {
+  if (!nusRxMutex) return;
+  String pending;
+  xSemaphoreTake(nusRxMutex, portMAX_DELAY);
+  int lastNl = nusRxBuffer.lastIndexOf('\n');
+  if (lastNl >= 0) {
+    pending = nusRxBuffer.substring(0, lastNl + 1);
+    nusRxBuffer = nusRxBuffer.substring(lastNl + 1);
+  }
+  xSemaphoreGive(nusRxMutex);
+
+  int start = 0, nl;
+  while ((nl = pending.indexOf('\n', start)) >= 0) {
+    handleGadgetbridgeLine(pending.substring(start, nl));
+    start = nl + 1;
+  }
+}
+
 void setupBLE() {
+  nusRxMutex = xSemaphoreCreateMutex();
   BLEDevice::init("Bangle.js Pip-Boy 3000"); // name must match Gadgetbridge's device-name allowlist
 
   // Default BLE TX power is +3dBm — plenty of range for a device that's
@@ -1642,11 +1668,16 @@ bool playMelt(lv_obj_t *next, bool captureOld) {
 // sits *below* the clock so it rises from the bottom to match its swipe.
 void goToScreen(uint8_t idx) {
   if (idx >= NUM_SCREENS) return;
+  // Unlike lv_screen_load_anim, playMelt has no "already showing" check of
+  // its own: without this it melts a screen into a copy of itself.
+  if (idx == currentScreen && lv_screen_active() == screens[idx]) {
+    forceRedraw = true;
+    return;
+  }
   uint8_t from = currentScreen;
   currentScreen = idx;
-  forceRedraw = true;
 
-  // Snapshot the outgoing screen only once the incoming one holds current
+  // No forceRedraw needed: this refresh is the one loop() would do. Snapshot the outgoing screen only once the incoming one holds current
   // content — otherwise the melt reveals a screen a second out of date.
   refreshAllScreens();
 
@@ -3310,6 +3341,10 @@ void loop() {
     lastDayMarker = today;
   }
 
+  // Gadgetbridge messages queued by the BLE task are parsed here, on the
+  // loop task, so they never race LVGL (see nusRxBuffer).
+  drainGadgetbridgeRx();
+
   // Touch input, screen navigation, and every gesture/tap action now flow
   // through LVGL's own input device + the onScreen* event callbacks
   // registered in setup() — nothing left to poll here.
@@ -3330,9 +3365,10 @@ void loop() {
   // A notification that popped itself up automatically reverts to the
   // clock face after a few seconds — unchanged behaviour, LVGL-native
   // navigation.
+  // Only if it's still showing: a tap elsewhere in the meantime stays put.
   if (notifAutoShown && now > notifAutoRevertMs) {
     notifAutoShown = false;
-    goToScreen(SCREEN_STAT);
+    if (currentScreen == SCREEN_NOTIF) goToScreen(SCREEN_STAT);
   }
 
   // Idle-dim, CRT flicker, and auto-sleep — unchanged from pipboy_watch.ino;
