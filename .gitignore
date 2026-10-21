@@ -1,6 +1,3 @@
-# Wi-Fi credentials — see pipboy_watch/secrets.h.example for the template
-pipboy_watch/secrets.h
-
 # Arduino build output
 build/
 *.bin

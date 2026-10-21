@@ -16,8 +16,8 @@ power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
   board.
 - **`pipboy_lvgl/`** — a full port of every `pipboy_watch/` feature onto
   LVGL widgets. See [below](#pipboy_lvgl--full-lvgl-port) for what's reused
-  vs. rebuilt and what's still unverified. Compiles and flashes; not yet
-  confirmed correct on real hardware.
+  vs. rebuilt and what's still unverified. Built, flashed and confirmed
+  working on the real board.
 - See [Exploring a richer UI](#exploring-a-richer-ui) below for the
   reasoning behind both. Nothing here has touched `pipboy_watch/` — it's
   unchanged.
@@ -319,6 +319,6 @@ for the exact permission path, including a known Android 13+/F-Droid
 Build/flash identically:
 
 ```
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M pipboy_lvgl
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M --upload -p <port> pipboy_lvgl
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled pipboy_lvgl
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled --upload -p <port> pipboy_lvgl
 ```
