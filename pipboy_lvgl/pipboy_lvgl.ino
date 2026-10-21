@@ -1,16 +1,16 @@
 // PIP-BOY 3000 watch face for the Waveshare ESP32-S3-Touch-LCD-1.28
 //
-// - Round GC9A01 display, green-phosphor CRT look, four screens (tap to
-//   cycle): STAT (clock + weather one-liner), DATA (steps), WEATHER (full
-//   temp/hi-lo/condition), NOTIF (latest phone notification).
-// - Step counting from the onboard QMI8658 accelerometer. The gyro
-//   (GYRO_ENABLED) is on too, feeding raise-to-wake: turning the wrist to
+// - Round GC9A01 display, green-phosphor CRT look. STAT (clock + weather
+//   one-liner) has a nav ring to WEATHER, NOTIF and MUSIC; SETTINGS is a
+//   swipe up. Steps, step history and the stopwatch were removed by request.
+// - The onboard QMI8658 IMU (accel + gyro, GYRO_ENABLED) is polled only
+//   while the screen is dimmed, for raise-to-wake: turning the wrist to
 //   look at the watch un-dims the screen without a touch, the same way a
 //   real smartwatch does. See updateRaiseToWake() — its thresholds are
 //   reasoned guesses pending calibration against real hardware, the same
 //   situation the swipe-axis knobs below started in.
 // - No physical power switch on this board — long-press-and-hold (3s,
-//   finger still) on the DATA screen puts it into a real ESP32 deep sleep
+//   finger still) on any screen puts it into a real ESP32 deep sleep
 //   instead, waking back up on the next touch. See enterDeepSleep() and the
 //   wake-from-sleep fast path near the top of setup().
 // - Time comes from WiFi + NTP on boot (this board has no RTC chip), then
@@ -56,7 +56,6 @@
 
 #include "LGFX_Config.hpp"
 #include "Touch_CST816S.h"
-#include "StepCounter.h"
 #include "vaultboy_bitmap.h"
 #include "nav_icons.h"
 
@@ -78,8 +77,6 @@ static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
 // screen you were on — screen-dependent actions proved unpredictable, since
 // waking from deep sleep reboots and lands back on STAT.
 static const uint32_t TAP_MAX_MS = 600;          // a press shorter than this, held still, counts as a tap
-static const uint32_t STEPS_RESET_ARM_MS = 4000; // gap allowed between taps before the count lapses
-static const uint8_t STEPS_RESET_TAPS = 4;       // deliberate taps needed to wipe the day's steps
 static const uint32_t LONG_PRESS_MS = 3000;       // hold at least this long, finger still, then release
 static const uint32_t SLEEP_PRESS_MAX_MS = 6000;  // 3-6s puts it to sleep; beyond that is the portal
 static const uint32_t LONG_PRESS_MAX_MS = 12000;  // ...and past this nothing fires, so something resting on
@@ -181,7 +178,7 @@ static const uint32_t RAISE_COOLDOWN_MS = 1500; // minimum gap between two raise
 // Plausible reason SWIPE_INVERT and VSWIPE_INVERT weren't equally reliable
 // guides: pipboy_watch's own real-world testing likely exercised
 // horizontal (screen-to-screen) swipes far more than the vertical ones
-// (NOTIF scroll, stopwatch clear), so VSWIPE_INVERT may never have been as
+// (NOTIF scroll), so VSWIPE_INVERT may never have been as
 // thoroughly confirmed as SWIPE_INVERT was.
 static const bool TOUCH_INVERT_X = false;
 static const bool TOUCH_INVERT_Y = true; // confirmed via live capture, 2026-09-20 — see above
@@ -220,15 +217,12 @@ static const uint16_t COL_AMBER     = lgfx::color565(255, 170, 60);   // fault/s
 // "darker", which is the same legibility problem the dim green had.
 static const uint16_t COL_YELLOW    = lgfx::color565(255, 220, 70);   // weather
 static const uint16_t COL_BLUE      = lgfx::color565(90, 175, 255);   // notifications
-static const uint16_t COL_RED       = lgfx::color565(255, 85, 75);    // stopwatch
-static const uint16_t COL_ORANGE    = lgfx::color565(255, 150, 50);   // steps (and step history)
 static const uint16_t COL_SCANLINE  = lgfx::color565(0, 30, 10);      // faint CRT texture
 
 // ---------- globals ----------
 LGFX display;
 TouchCST816S touch;
 QMI8658 imu;
-StepCounter stepCounter;
 Preferences prefs;
 
 bool touchOk = false;
@@ -238,29 +232,18 @@ volatile bool bleConnected = false;
 volatile bool timeSynced = false;
 uint8_t currentScreen = 0; // see the SCREEN_* slots below
 const uint8_t SCREEN_STAT = 0;       // clock, date, weather line, notification banner — has direct-nav buttons to every other screen
-const uint8_t SCREEN_DATA = 1;       // step count
-const uint8_t SCREEN_HISTORY = 2;    // 7-day step history bar chart — grouped next to DATA
-const uint8_t SCREEN_WEATHER = 3;    // full weather
-const uint8_t SCREEN_NOTIF = 4;      // notification list
-const uint8_t SCREEN_MUSIC = 5;      // now-playing, from Gadgetbridge — grouped next to NOTIF
-const uint8_t SCREEN_STOPWATCH = 6;
-const uint8_t SCREEN_SETTINGS = 7;   // reached by swiping down on STAT, deliberately not in the nav ring
-const uint8_t NUM_SCREENS = 8;
-// TIMER and FLASHLIGHT removed by request — see git history (or
-// pipboy_watch.ino, which still has both) if either needs reviving.
+const uint8_t SCREEN_WEATHER = 1;    // full weather
+const uint8_t SCREEN_NOTIF = 2;      // notification list
+const uint8_t SCREEN_MUSIC = 3;      // now-playing, from Gadgetbridge — grouped next to NOTIF
+const uint8_t SCREEN_SETTINGS = 4;   // reached by swiping up on STAT, deliberately not in the nav ring
+const uint8_t NUM_SCREENS = 5;
+// TIMER and FLASHLIGHT, then DATA (steps), HISTORY (7-day steps) and the
+// STOPWATCH were removed by request — see git history (or pipboy_watch.ino,
+// which still has them) if any needs reviving.
 // Nothing persists currentScreen across a boot (it always starts back at
 // SCREEN_STAT — see wokeFromSleep in setup()), so renumbering these between
 // firmware versions is safe: no stored value anywhere depends on the
 // specific numbers.
-
-// ---------- stopwatch ----------
-// Keeps running while you're on other screens; it's only *displayed* by
-// its own screen. Elapsed time is derived from millis() rather than
-// counted up in the loop, so it can't drift with however often the loop
-// happens to run.
-bool swRunning = false;
-uint32_t swStartMs = 0;   // millis() at the last start
-uint32_t swAccumMs = 0;   // time banked by previous start/stop cycles
 
 // The old hand-rolled touch debounce/gesture-tracking globals (raw poll
 // state, gesture-start position, etc.) are gone — LVGL's input device
@@ -313,15 +296,6 @@ static const time_t WEATHER_MAX_AGE_SEC = 12 * 60 * 60;
 // Below this, it's current enough not to bother captioning with an age.
 static const time_t WEATHER_FRESH_SEC = 15 * 60;
 
-// ---------- step history ----------
-// The past 6 *completed* days' final step totals, oldest first — index 5 is
-// the most recently finished day. "Today" is deliberately not stored here;
-// it's read live from stepCounter so the HISTORY screen's rightmost bar
-// updates as you walk instead of only appearing at day-rollover. Shifted
-// and persisted once/day — see the day-rollover block in loop() and
-// saveState().
-uint32_t stepHist[6] = {0, 0, 0, 0, 0, 0};
-
 // ---------- now playing (from Gadgetbridge) ----------
 // Populated from the Bangle.js "musicinfo"/"musicstate" messages Gadgetbridge
 // already sends over the same NUS channel as notify/weather — see
@@ -335,24 +309,18 @@ bool musicPlaying = false;
 // Duration/position for the MUSIC screen's progress ring. Gadgetbridge
 // doesn't push position every second — it arrives occasionally in
 // "musicstate" — so the displayed position is extrapolated forward from
-// the last known value using millis() while playing, the same "derive
-// from a timestamp, don't count up in the loop" approach the stopwatch and
-// timer already use elsewhere in this file.
+// the last known value using millis() while playing, rather than counted
+// up in the loop.
 long musicDurSec = 0;
 long musicPositionSec = 0;
 uint32_t musicPositionStampMs = 0;
 
-// Latest gyro reading (deg/sec), updated every IMU poll alongside the accel
-// feed into StepCounter. Not consumed by anything yet — available for
-// whatever reads it next.
+// Latest gyro reading (deg/sec), updated every IMU poll — see
+// updateRaiseToWake().
 float gyroX = 0, gyroY = 0, gyroZ = 0;
 
 uint32_t lastImuPollMs = 0;
 uint32_t lastImuTraceMs = 0;
-uint32_t lastFastDrawMs = 0;
-uint32_t stepsResetArmedMs = 0; // time of the most recent reset tap, 0 when not counting
-uint8_t stepsResetTaps = 0;     // taps counted so far toward STEPS_RESET_TAPS
-uint32_t lastSaveMs = 0;
 // RTC_DATA_ATTR survives deep sleep (backed by RTC slow memory, unlike
 // regular globals which reset every wake) but not a full power cycle — that
 // initializes it back to 0, which is fine, since a fresh boot always makes
@@ -363,7 +331,6 @@ uint32_t lastSaveMs = 0;
 RTC_DATA_ATTR time_t rtcLastSyncAttemptEpoch = 0;
 uint32_t lastActivityMs = 0;
 bool backlightDimmed = false;
-uint32_t lastDayMarker = 0; // epoch-day steps were last reset on
 uint32_t nextFlickerMs = 0; // when the next CRT power-flicker blip is due — see loop()
 int lastRenderedSecond = -1;
 
@@ -380,7 +347,6 @@ uint32_t lastRaiseWakeMs = 0;   // last time raise-to-wake actually fired, for R
 // treat the value as the time to display, no timezone math needed here.
 static const char *SERVICE_UUID     = "7a2b0001-6b1d-4a6f-9c2e-6f2f6f1b0a01";
 static const char *TIME_CHAR_UUID   = "7a2b0002-6b1d-4a6f-9c2e-6f2f6f1b0a01";
-static const char *STEPS_CHAR_UUID  = "7a2b0003-6b1d-4a6f-9c2e-6f2f6f1b0a01";
 
 // Nordic UART Service — the standard BLE "serial port" profile. Gadgetbridge
 // talks this to any device it treats as a "Bangle.js" watch: it writes
@@ -391,7 +357,6 @@ static const char *NUS_RX_UUID      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *NUS_TX_UUID      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
 BLEServer *bleServer = nullptr;
-BLECharacteristic *stepsChar = nullptr;
 BLEAdvertising *bleAdvertising = nullptr;
 // Raw bytes from the NUS RX characteristic, appended on the BLE task and
 // drained (split into lines and parsed) on the loop task by
@@ -678,10 +643,6 @@ void setupBLE() {
   BLECharacteristic *timeChar = svc->createCharacteristic(
       TIME_CHAR_UUID, BLECharacteristic::PROPERTY_WRITE);
   timeChar->setCallbacks(new TimeWriteCallbacks());
-
-  stepsChar = svc->createCharacteristic(
-      STEPS_CHAR_UUID, BLECharacteristic::PROPERTY_READ);
-  stepsChar->setValue("0");
 
   svc->start();
 
@@ -1044,14 +1005,12 @@ int readBatteryPercent() {
 // ---------- persistence ----------
 void loadState() {
   prefs.begin("pipboy", false);
-  stepCounter.begin(prefs.getUInt("steps", 0));
-  lastDayMarker = prefs.getUInt("dayMarker", 0);
-
-  // Past 6 completed days' totals for the HISTORY screen. getBytes() returns
-  // 0 (not sizeof(stepHist)) on first-ever boot, when the key doesn't exist
-  // yet — treated the same as "no history", not as corruption.
-  size_t histLen = prefs.getBytes("stepHist", stepHist, sizeof(stepHist));
-  if (histLen != sizeof(stepHist)) memset(stepHist, 0, sizeof(stepHist));
+  // Old firmware stored steps here; drop those keys rather than leave them.
+  if (prefs.isKey("steps")) {
+    prefs.remove("steps");
+    prefs.remove("dayMarker");
+    prefs.remove("stepHist");
+  }
 
   // User settings — each falls back to the compile-time default if unset.
   cfgBrightness = (uint8_t)prefs.getUChar("cfgBright", BRIGHT_ACTIVE);
@@ -1074,9 +1033,8 @@ void loadState() {
   prefs.end();
 }
 
-// Settings are written on change rather than on the periodic saveState()
-// tick — they change rarely and a stale value surviving a reboot would be
-// more annoying than the handful of extra flash writes.
+// Settings are written on change: they change rarely and a stale value
+// surviving a reboot would be more annoying than the extra flash writes.
 void saveSettings() {
   prefs.begin("pipboy", false);
   prefs.putUChar("cfgBright", cfgBrightness);
@@ -1111,29 +1069,6 @@ long weatherAgeSec() {
 bool weatherTooStale() {
   long age = weatherAgeSec();
   return age >= 0 && age > WEATHER_MAX_AGE_SEC;
-}
-
-void saveState() {
-  // Flash writes cost real current (and wear) — skip the NVS commit
-  // entirely on the common case of "nothing changed since last save"
-  // (e.g. sitting still between steps). Doesn't change the save
-  // guarantee at all: still checked/written every 30s the instant
-  // something *does* change, same window as before.
-  static uint32_t lastSavedSteps = UINT32_MAX;
-  static uint32_t lastSavedDayMarker = UINT32_MAX;
-  uint32_t steps = stepCounter.count();
-  if (steps == lastSavedSteps && lastDayMarker == lastSavedDayMarker) return;
-
-  prefs.begin("pipboy", false);
-  prefs.putUInt("steps", steps);
-  prefs.putUInt("dayMarker", lastDayMarker);
-  // stepHist only actually changes at day-rollover, which is exactly the
-  // moment lastDayMarker changes too — so this write is never wasted, and
-  // never needs its own separate change-tracking.
-  prefs.putBytes("stepHist", stepHist, sizeof(stepHist));
-  prefs.end();
-  lastSavedSteps = steps;
-  lastSavedDayMarker = lastDayMarker;
 }
 
 // ---------- power ----------
@@ -1225,7 +1160,6 @@ void powerDownAndDeepSleep() {
 
 void enterDeepSleep() {
   Serial.println("[pipboy] long-press -> entering deep sleep...");
-  saveState(); // catch any steps counted since the last periodic save
 
   // Say so on screen before going dark. Without this, sleeping looks
   // identical to a crash or a reboot — and since waking is a full restart,
@@ -1812,37 +1746,7 @@ void onScreenReleased(lv_event_t *e) {
   // screen; see pipboy_watch's identical comment on this.
   bool longPress = pressHeldStill && heldMs >= LONG_PRESS_MS && heldMs <= LONG_PRESS_MAX_MS;
 
-  if (tapGesture && currentScreen == SCREEN_STOPWATCH) {
-    if (swRunning) {
-      swAccumMs += millis() - swStartMs;
-      swRunning = false;
-    } else {
-      swStartMs = millis();
-      swRunning = true;
-    }
-    forceRedraw = true;
-
-  } else if (tapGesture && currentScreen == SCREEN_DATA) {
-    // Four deliberate taps, each within STEPS_RESET_ARM_MS of the last,
-    // before a day's step count is wiped — identical gesture to
-    // pipboy_watch's, same reasoning (nothing else here is destructive).
-    uint32_t now = millis();
-    if (stepsResetArmedMs && now - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
-      stepsResetTaps++;
-    } else {
-      stepsResetTaps = 1;
-    }
-    stepsResetArmedMs = now;
-    if (stepsResetTaps >= STEPS_RESET_TAPS) {
-      stepCounter.set(0);
-      saveState();
-      stepsResetArmedMs = 0;
-      stepsResetTaps = 0;
-      Serial.println("[pipboy] steps reset by user.");
-    }
-    forceRedraw = true;
-
-  } else if (longPress) {
+  if (longPress) {
     Serial.printf("[pipboy] long-press released after %lums on screen %u\n",
                   (unsigned long)heldMs, currentScreen);
     if (heldMs < SLEEP_PRESS_MAX_MS) {
@@ -1856,8 +1760,8 @@ void onScreenReleased(lv_event_t *e) {
 
 // Left/right swipe navigation between screens is gone by request —
 // getting around is now entirely via the nav ring on STAT and the back
-// button on every other screen. The only gesture left is the
-// stopwatch-clear swipe, which was never screen-to-screen navigation.
+// button on every other screen. The only gesture left is swipe-up for
+// settings.
 void onScreenGesture(lv_event_t *e) {
   if (pressWasDimWake) return; // a wake-touch must not also act — see pipboy_watch's identical rule
   lv_indev_t *indev = lv_indev_active();
@@ -1866,15 +1770,9 @@ void onScreenGesture(lv_event_t *e) {
 
   if (dir == LV_DIR_TOP && currentScreen == SCREEN_STAT) {
     // The one navigation gesture left: swiping up on the clock face brings
-    // settings up. Kept as a gesture rather than a seventh nav badge so the
+    // settings up. Kept as a gesture rather than a nav badge so the
     // ring's spacing stays as-is.
     goToScreen(SCREEN_SETTINGS);
-
-  } else if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
-    if (currentScreen == SCREEN_STOPWATCH && !swRunning) {
-      swAccumMs = 0;
-      forceRedraw = true;
-    }
   }
 }
 
@@ -1981,7 +1879,6 @@ static const int NAV_BTN_PX = 40; // nav badge diameter
 // true of any detail drawn that small. These are stored white with an
 // alpha channel and tinted to each badge's accent colour via LVGL's image
 // recolor style, so one bitmap serves whatever colour the badge is.
-static lv_image_dsc_t navWalkImgDsc;
 static lv_image_dsc_t navSunImgDsc;
 
 static void initNavIconDsc(lv_image_dsc_t &dsc, const uint8_t *map, int w, int h) {
@@ -1995,7 +1892,6 @@ static void initNavIconDsc(lv_image_dsc_t &dsc, const uint8_t *map, int w, int h
 }
 
 void initNavIcons() {
-  initNavIconDsc(navWalkImgDsc, NAV_ICON_WALK_MAP, NAV_ICON_WALK_W, NAV_ICON_WALK_H);
   initNavIconDsc(navSunImgDsc, NAV_ICON_SUN_MAP, NAV_ICON_SUN_W, NAV_ICON_SUN_H);
 }
 
@@ -2073,26 +1969,15 @@ void buildStatScreen() {
   lv_obj_set_style_bg_color(s, lv_color_black(), 0);
   lv_color_t accent = lv_color_hex(0x55FF6E); // COL_GREEN
 
-  // Nav ring spread across a much wider arc — ±100° from top rather than
-  // the ±68° it was crammed into, which left the six badges bunched in a
-  // narrow band across the top. Going wider means the outermost two drop
-  // to abs y≈136, just past the panel's midline, which is fine at the far
-  // left and right: neither the date row (x≈65-175) nor the weather
-  // icon/temperature row below it (x≈66-170) reaches that far out, so
-  // there's nothing down there to collide with.
-  //
-  // Spacing is set by geometry, not guesswork: 40px badges need ≥42px
-  // between centres, and a 200° span at r=92 puts them 40° (≈63px) apart —
-  // comfortably clear. Offsets are r·sin(θ) / −r·cos(θ). Still worth an
-  // eyeball pass on the real panel, same as every other pixel-exact spot
-  // in this file.
   initNavIcons();
-  makeNavButton(s, "SW", lv_color_hex(0xFF554B), SCREEN_STOPWATCH, -91, 16);            // COL_RED, -100°
-  makeNavButton(s, LV_SYMBOL_AUDIO, lv_color_hex(0xAF6EFF), SCREEN_MUSIC, -80, -46);    // COL_PURPLE, -60°
-  navNotifBtn = makeNavButton(s, LV_SYMBOL_BELL, lv_color_hex(0x5AAFFF), SCREEN_NOTIF, -31, -86); // COL_BLUE, -20°
-  makeNavButtonImg(s, &navWalkImgDsc, lv_color_hex(0x55FF6E), SCREEN_DATA, 31, -86);    // COL_GREEN, +20°
-  makeNavButton(s, "7D", lv_color_hex(0xFF9632), SCREEN_HISTORY, 80, -46);              // COL_ORANGE, +60°
-  makeNavButtonImg(s, &navSunImgDsc, lv_color_hex(0xFFDC46), SCREEN_WEATHER, 91, 16);   // COL_YELLOW, +100°
+  // Nav ring: three badges since steps, history and the stopwatch went
+  // (2026-10-21), centred on the top at -40°/0°/+40° on r=92. 40px badges
+  // need >=42px between centres; the 40° (~63px) pitch is the one the old
+  // six-badge ring was confirmed with. Offsets are r·sin(θ) / −r·cos(θ).
+  // Needs a look on the real panel.
+  makeNavButton(s, LV_SYMBOL_AUDIO, lv_color_hex(0xAF6EFF), SCREEN_MUSIC, -59, -70);    // COL_PURPLE, -40°
+  navNotifBtn = makeNavButton(s, LV_SYMBOL_BELL, lv_color_hex(0x5AAFFF), SCREEN_NOTIF, 0, -92); // COL_BLUE, 0°
+  makeNavButtonImg(s, &navSunImgDsc, lv_color_hex(0xFFDC46), SCREEN_WEATHER, 59, -70);  // COL_YELLOW, +40°
 
   // The notification banner that used to sit at the top of this screen is
   // gone — the nav ring now occupies that band, and it was the only row
@@ -2172,117 +2057,6 @@ void updateStatScreen(struct tm &t, int battPct) {
   }
 
   updateStatusCluster(SCREEN_STAT, battPct);
-}
-
-// ---------- screen: DATA ----------
-lv_obj_t *dataTitle, *dataCount, *dataSub;
-
-void buildDataScreen() {
-  lv_obj_t *s = screens[SCREEN_DATA] = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(s, lv_color_black(), 0);
-  lv_color_t accent = lv_color_hex(0x55FF6E); // COL_GREEN — steps moved off orange; HISTORY keeps orange so the two stay tellable apart
-
-  dataTitle = lv_label_create(s);
-  lv_obj_set_style_text_font(dataTitle, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(dataTitle, accent, 0);
-  lv_label_set_text(dataTitle, "Steps");
-  lv_obj_align(dataTitle, LV_ALIGN_TOP_MID, 0, 44);
-
-  dataCount = lv_label_create(s);
-  lv_obj_set_style_text_font(dataCount, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(dataCount, accent, 0);
-  lv_label_set_text(dataCount, "0");
-  lv_obj_align(dataCount, LV_ALIGN_CENTER, 0, 0);
-
-  dataSub = lv_label_create(s);
-  lv_obj_set_style_text_font(dataSub, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(dataSub, accent, 0);
-  lv_label_set_text(dataSub, "tap 4x to reset");
-  lv_obj_align(dataSub, LV_ALIGN_CENTER, 0, 44);
-
-  clusterLabel[SCREEN_DATA] = buildStatusCluster(s, accent);
-  addBackNav(s, SCREEN_DATA, accent);
-}
-
-void updateDataScreen(int steps, int battPct) {
-  char stepbuf[12];
-  snprintf(stepbuf, sizeof(stepbuf), "%lu", (unsigned long)steps);
-  lv_label_set_text(dataCount, stepbuf);
-
-  if (stepsResetArmedMs && millis() - stepsResetArmedMs < STEPS_RESET_ARM_MS) {
-    char prompt[28];
-    snprintf(prompt, sizeof(prompt), "RESET? TAP %u MORE", STEPS_RESET_TAPS - stepsResetTaps);
-    lv_label_set_text(dataSub, prompt);
-  } else {
-    float km = steps * 0.00075f; // ~0.75m average stride — same as pipboy_watch
-    char distbuf[24];
-    snprintf(distbuf, sizeof(distbuf), "~%.2f KM", km);
-    lv_label_set_text(dataSub, distbuf);
-  }
-
-  updateStatusCluster(SCREEN_DATA, battPct);
-}
-
-// ---------- screen: HISTORY ----------
-// Native lv_bar widgets instead of pipboy_watch's hand-drawn fillRect bars
-// (see drawHistoryScreen() in pipboy_watch.ino) — same 7-day-window idea
-// (stepHist[0..5] plus today, read live from stepCounter), LVGL just draws
-// the bars itself.
-lv_obj_t *histTitle, *histBars[7], *histLabels[7];
-
-void buildHistoryScreen() {
-  lv_obj_t *s = screens[SCREEN_HISTORY] = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(s, lv_color_black(), 0);
-  lv_color_t accent = lv_color_hex(0xFF9632); // COL_ORANGE
-
-  histTitle = lv_label_create(s);
-  lv_obj_set_style_text_font(histTitle, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(histTitle, accent, 0);
-  lv_label_set_text(histTitle, "7-Day Steps");
-  lv_obj_align(histTitle, LV_ALIGN_TOP_MID, 0, 42); // 42 not 30: the status cluster now sits at the top on this screen
-
-  const int barW = 16, gap = 6, totalW = 7 * barW + 6 * gap;
-  int x0 = -totalW / 2 + barW / 2;
-  for (int i = 0; i < 7; i++) {
-    histBars[i] = lv_bar_create(s);
-    lv_obj_set_size(histBars[i], barW, 90);
-    lv_bar_set_range(histBars[i], 0, 100);
-    lv_obj_set_style_bg_color(histBars[i], lv_color_hex(0x193B2A), LV_PART_MAIN); // COL_GREEN_DIM-ish track
-    lv_obj_set_style_bg_color(histBars[i], (i == 6) ? accent : lv_color_hex(0x196428), LV_PART_INDICATOR);
-    lv_obj_align(histBars[i], LV_ALIGN_CENTER, x0 + i * (barW + gap), 10);
-
-    histLabels[i] = lv_label_create(s);
-    lv_obj_set_style_text_font(histLabels[i], &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(histLabels[i], (i == 6) ? accent : lv_color_hex(0x196428), 0);
-    lv_label_set_text(histLabels[i], "-");
-    lv_obj_align_to(histLabels[i], histBars[i], LV_ALIGN_OUT_BOTTOM_MID, 0, 6);
-  }
-
-  clusterLabel[SCREEN_HISTORY] = buildStatusCluster(s, accent);
-  addBackNav(s, SCREEN_HISTORY, accent);
-}
-
-void updateHistoryScreen(int battPct) {
-  uint32_t vals[7];
-  for (uint8_t i = 0; i < 6; i++) vals[i] = stepHist[i];
-  vals[6] = stepCounter.count();
-
-  uint32_t maxVal = 1;
-  for (uint8_t i = 0; i < 7; i++) if (vals[i] > maxVal) maxVal = vals[i];
-
-  static const char *dowInitial[7] = {"S", "M", "T", "W", "T", "F", "S"};
-  time_t nowEpoch = time(nullptr);
-  struct tm lt;
-  localtime_r(&nowEpoch, &lt);
-
-  for (uint8_t i = 0; i < 7; i++) {
-    int pct = (int)((uint64_t)vals[i] * 100 / maxVal);
-    lv_bar_set_value(histBars[i], pct, LV_ANIM_OFF);
-    int wday = ((lt.tm_wday - (6 - i)) % 7 + 7) % 7;
-    lv_label_set_text(histLabels[i], dowInitial[wday]);
-  }
-
-  updateStatusCluster(SCREEN_HISTORY, battPct);
 }
 
 // ---------- screen: WEATHER ----------
@@ -2684,8 +2458,7 @@ void updateMusicScreen(int battPct) {
 
     // Position is extrapolated forward from the last known value while
     // playing — Gadgetbridge only pushes it occasionally, not every
-    // second — same "derive from a timestamp" approach the stopwatch and
-    // timer already use.
+    // second.
     long posSec = musicPositionSec;
     if (musicPlaying) posSec += (millis() - musicPositionStampMs) / 1000;
     if (musicDurSec > 0 && posSec > musicDurSec) posSec = musicDurSec;
@@ -2708,56 +2481,9 @@ void updateMusicScreen(int battPct) {
   updateStatusCluster(SCREEN_MUSIC, battPct);
 }
 
-// ---------- screen: STOPWATCH ----------
-lv_obj_t *swElapsed, *swHint;
-
-uint32_t stopwatchElapsedMs() {
-  return swAccumMs + (swRunning ? (millis() - swStartMs) : 0);
-}
-
-void buildStopwatchScreen() {
-  lv_obj_t *s = screens[SCREEN_STOPWATCH] = lv_obj_create(NULL);
-  lv_obj_set_style_bg_color(s, lv_color_black(), 0);
-  lv_color_t accent = lv_color_hex(0xFF554B); // COL_RED
-
-  lv_obj_t *title = lv_label_create(s);
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(title, accent, 0);
-  lv_label_set_text(title, "Stopwatch");
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 42); // 42 not 30: the status cluster now sits at the top on this screen
-
-  swElapsed = lv_label_create(s);
-  lv_obj_set_style_text_font(swElapsed, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(swElapsed, accent, 0);
-  lv_label_set_text(swElapsed, "00:00.0");
-  lv_obj_align(swElapsed, LV_ALIGN_CENTER, 0, 0);
-
-  swHint = lv_label_create(s);
-  lv_obj_set_style_text_font(swHint, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(swHint, accent, 0);
-  lv_label_set_text(swHint, "tap to start");
-  lv_obj_align(swHint, LV_ALIGN_CENTER, 0, 44);
-
-  clusterLabel[SCREEN_STOPWATCH] = buildStatusCluster(s, accent);
-  addBackNav(s, SCREEN_STOPWATCH, accent);
-}
-
-void updateStopwatchScreen(int battPct) {
-  uint32_t ms = stopwatchElapsedMs();
-  uint32_t totalSec = ms / 1000;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%02lu:%02lu.%lu", (unsigned long)(totalSec / 60), (unsigned long)(totalSec % 60),
-           (unsigned long)((ms % 1000) / 100));
-  lv_label_set_text(swElapsed, buf);
-  lv_label_set_text(swHint, swRunning ? "tap to stop" : (ms > 0 ? "tap to start / swipe to clear" : "tap to start"));
-  updateStatusCluster(SCREEN_STOPWATCH, battPct);
-}
-
-
 // ---------- screen: SETTINGS ----------
-// Reached by swiping down on the clock face rather than taking a seventh
-// slot in the nav ring — the ring's spacing was settled and adding another
-// badge would have meant shrinking or crowding all of them.
+// Reached by swiping up on the clock face rather than taking a slot in the
+// nav ring.
 //
 // Every value here was a compile-time constant before this screen existed;
 // each writes through to NVS on change (saveSettings()) so it survives a
@@ -2968,16 +2694,12 @@ void refreshAllScreens() {
   time_t nowEpoch = time(nullptr);
   struct tm t;
   localtime_r(&nowEpoch, &t);
-  int steps = stepCounter.count();
   int battPct = readBatteryPercent();
 
   updateStatScreen(t, battPct);
-  updateDataScreen(steps, battPct);
-  updateHistoryScreen(battPct);
   updateWeatherScreen(battPct);
   updateNotifScreen(battPct);
   updateMusicScreen(battPct);
-  updateStopwatchScreen(battPct);
 }
 
 // ---------- Vault Boy / boot screen ----------
@@ -3272,12 +2994,9 @@ void setup() {
   }
 
   buildStatScreen();
-  buildDataScreen();
-  buildHistoryScreen();
   buildWeatherScreen();
   buildNotifScreen();
   buildMusicScreen();
-  buildStopwatchScreen();
   buildSettingsScreen();
   buildScanlineOverlay();
   lv_obj_set_style_bg_image_opa(lv_layer_top(), cfgScanlines ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
@@ -3302,43 +3021,19 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // Poll the IMU at ~50Hz and feed the pedometer (and, while dimmed,
-  // raise-to-wake). Unchanged from pipboy_watch.ino.
-  if (imuOk && now - lastImuPollMs >= 20) {
+  // Poll the IMU at ~50Hz for raise-to-wake. With the pedometer gone that
+  // is its only use, so it's only read while the screen is dimmed.
+  if (imuOk && GYRO_ENABLED && backlightDimmed && now - lastImuPollMs >= 20) {
     lastImuPollMs = now;
     float ax, ay, az;
     bool accelOk = imu.readAccelMPS2(ax, ay, az);
-    if (accelOk) {
-      stepCounter.update(ax, ay, az);
+    imu.readGyro(gyroX, gyroY, gyroZ);
+    updateRaiseToWake(accelOk, ax, ay, az, now);
+    if (IMU_TRACE && now - lastImuTraceMs >= 1000) {
+      lastImuTraceMs = now;
+      Serial.printf("[pipboy] imu a=(%.1f,%.1f,%.1f) g=(%.0f,%.0f,%.0f) dim=%d\n",
+                    ax, ay, az, gyroX, gyroY, gyroZ, backlightDimmed);
     }
-    if (GYRO_ENABLED) {
-      imu.readGyro(gyroX, gyroY, gyroZ);
-      if (backlightDimmed) updateRaiseToWake(accelOk, ax, ay, az, now);
-      if (IMU_TRACE && now - lastImuTraceMs >= 1000) {
-        lastImuTraceMs = now;
-        Serial.printf("[pipboy] imu a=(%.1f,%.1f,%.1f) g=(%.0f,%.0f,%.0f) dim=%d\n",
-                      ax, ay, az, gyroX, gyroY, gyroZ, backlightDimmed);
-      }
-    }
-  }
-
-  // Day rollover — unchanged from pipboy_watch.ino.
-  if (timeSynced) {
-    time_t nowEpoch = time(nullptr);
-    struct tm lt;
-    localtime_r(&nowEpoch, &lt);
-    uint32_t today = (uint32_t)((lt.tm_year + 1900) * 10000u + (lt.tm_mon + 1) * 100u + lt.tm_mday);
-    if (lastDayMarker != 0 && today != lastDayMarker) {
-      uint32_t finished = stepCounter.count();
-      for (uint8_t i = 0; i + 1 < 6; i++) stepHist[i] = stepHist[i + 1];
-      stepHist[5] = finished;
-      Serial.printf("[pipboy] new day (%lu -> %lu), resetting steps (yesterday: %lu)\n",
-                    (unsigned long)lastDayMarker, (unsigned long)today, (unsigned long)finished);
-      stepCounter.set(0);
-      lastDayMarker = today;
-      saveState();
-    }
-    lastDayMarker = today;
   }
 
   // Gadgetbridge messages queued by the BLE task are parsed here, on the
@@ -3386,78 +3081,22 @@ void loop() {
     nextFlickerMs = now + 4000 + random(4000);
   }
 
-  if (touchOk && AUTO_SLEEP_TIMEOUT_MS && !swRunning &&
+  if (touchOk && AUTO_SLEEP_TIMEOUT_MS &&
       now - lastActivityMs > AUTO_SLEEP_TIMEOUT_MS) {
     Serial.println("[pipboy] idle timeout -> deep sleep");
     enterDeepSleep(); // never returns
   }
 
-  // Keep the BLE "steps" characteristic fresh — unchanged.
-  static uint32_t lastStepsPublish = 0;
-  if (now - lastStepsPublish > 2000) {
-    lastStepsPublish = now;
-    if (stepsChar) {
-      char buf[12];
-      snprintf(buf, sizeof(buf), "%lu", (unsigned long)stepCounter.count());
-      stepsChar->setValue((uint8_t *)buf, strlen(buf));
-    }
-  }
-
-  // Report activity to Gadgetbridge so steps land in its own charts, not
-  // just on the watch. Format per Espruino's Gadgetbridge protocol docs:
-  //   {"t":"act","ts":<ms since epoch>,"stp":<steps>,"hrm":0,"mov":0,"rt":0}
-  // `stp` is sent as the count accrued *since the last report*, not the
-  // running daily total — Gadgetbridge stores these as per-interval
-  // activity samples, so a cumulative value would read as a huge spike
-  // every minute. (That reading of the field is from the docs' wording
-  // rather than something confirmed against Gadgetbridge's charts, so if
-  // the totals there look wrong, this is the line to revisit.)
-  //
-  // Only sent once the clock is trustworthy: a sample timestamped from an
-  // unsynced clock would be filed under 1970 and pollute the history.
-  static uint32_t lastActReportMs = 0;
-  static uint32_t lastActSteps = 0;
-  if (bleConnected && timeSynced && now - lastActReportMs > 60000) {
-    uint32_t stepsNow = stepCounter.count();
-    // A day rollover (or a manual reset) takes the count backwards; report
-    // nothing for that interval rather than a negative-turned-huge delta.
-    uint32_t delta = (stepsNow >= lastActSteps) ? (stepsNow - lastActSteps) : 0;
-    lastActReportMs = now;
-    lastActSteps = stepsNow;
-
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-             "{\"t\":\"act\",\"ts\":%llu000,\"stp\":%lu,\"hrm\":0,\"mov\":0,\"rt\":0}",
-             (unsigned long long)time(nullptr), (unsigned long)delta);
-    sendGadgetbridgeLine(buf);
-  }
-
   // Refresh every screen's dynamic content once/second, or immediately when
-  // forceRedraw asks for it, or faster while the stopwatch is running and
-  // visible — same cadence pipboy_watch's render()/forceRedraw used, just
+  // forceRedraw asks for it — same cadence pipboy_watch's render()/forceRedraw used, just
   // driving refreshAllScreens() instead of a full immediate-mode repaint.
   time_t nowSec = time(nullptr);
   struct tm t;
   localtime_r(&nowSec, &t);
-  bool fastTick = (currentScreen == SCREEN_STOPWATCH && swRunning && now - lastFastDrawMs >= 100);
-  if (forceRedraw || t.tm_sec != lastRenderedSecond || fastTick) {
+  if (forceRedraw || t.tm_sec != lastRenderedSecond) {
     refreshAllScreens();
     lastRenderedSecond = t.tm_sec;
-    lastFastDrawMs = now;
     forceRedraw = false;
-  }
-
-  // Armed step-reset prompt expiry — unchanged.
-  if (stepsResetArmedMs && now - stepsResetArmedMs >= STEPS_RESET_ARM_MS) {
-    stepsResetArmedMs = 0;
-    stepsResetTaps = 0;
-    forceRedraw = true;
-  }
-
-  // Persist steps every 30s — unchanged.
-  if (now - lastSaveMs > 30000) {
-    lastSaveMs = now;
-    saveState();
   }
 
   // Periodic WiFi resync — unchanged.
