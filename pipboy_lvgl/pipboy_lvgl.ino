@@ -1560,10 +1560,14 @@ void meltPushFrame(const int16_t *colY) {
       uint16_t *dst = meltBlock + (uint32_t)r * 240;
       for (uint8_t c = 0; c < MELT_COLS; c++) {
         uint16_t x = (uint16_t)c * MELT_COL_W;
-        // row - colY[c] can't reach 240: colY[c] <= 240 and row <= 239, so
-        // a strip that has fallen clean off is simply all-new-screen here.
-        const uint16_t *src = (row < colY[c]) ? (meltNewPx + (uint32_t)row * 240)
-                                              : (meltOldPx + (uint32_t)(row - colY[c]) * 240);
+        // A strip still waiting its turn has a negative colY; it hasn't
+        // moved yet, so it shows the old screen unshifted. Clamping matters:
+        // row - colY with colY < 0 would read past the end of meltOldPx.
+        // With fall >= 0, row - fall stays in 0..239 (fall <= 240), and a
+        // strip that has fallen clean off is simply all-new-screen here.
+        int16_t fall = colY[c] > 0 ? colY[c] : 0;
+        const uint16_t *src = (row < fall) ? (meltNewPx + (uint32_t)row * 240)
+                                           : (meltOldPx + (uint32_t)(row - fall) * 240);
         memcpy(dst + x, src + x, MELT_COL_W * 2);
       }
     }
