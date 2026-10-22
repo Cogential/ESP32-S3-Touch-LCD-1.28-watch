@@ -1,21 +1,21 @@
 // lvgl_watch — proof-of-concept: LVGL v9 running on top of the same
-// already-verified LovyanGFX panel driver as pipboy_watch, to see what a
+// already-verified LovyanGFX panel driver as esp32-watch-original, to see what a
 // real widget-toolkit UI looks like on this exact board. Deliberately NOT
 // a second full watch app: no WiFi/BLE/steps/sleep here — just enough to
 // prove the render + touch pipeline works, and show what LVGL's stock
-// widgets (arcs, labels, animation) look like next to pipboy_watch's
+// widgets (arcs, labels, animation) look like next to esp32-watch-original's
 // hand-drawn screens. See the repo README's "Exploring a richer UI"
 // section for the reasoning behind this approach (why LovyanGFX stays the
 // low-level driver instead of switching to TFT_eSPI, why v9 over v8.3).
 //
 // Panel is left at its native, unrotated orientation on purpose: the touch
-// controller (Touch_CST816S.h, copied unchanged from pipboy_watch/) reports
+// controller (Touch_CST816S.h, copied unchanged from esp32-watch-original/) reports
 // raw, unrotated panel coordinates, and LVGL needs those to line up exactly
-// with what's drawn for hit-testing to work at all. pipboy_watch never had
+// with what's drawn for hit-testing to work at all. esp32-watch-original never had
 // to solve that: it only reads swipe deltas and tap/hold duration, never an
 // absolute tap position, so its display.setRotation(1) never needed a
 // matching touch remap. Getting rotation working here (to match
-// pipboy_watch's upright orientation) needs that remap worked out — not
+// esp32-watch-original's upright orientation) needs that remap worked out — not
 // attempted in this proof-of-concept.
 
 #define LV_CONF_INCLUDE_SIMPLE
@@ -38,7 +38,7 @@ lv_obj_t *clockLabel = nullptr;
 lv_obj_t *ring = nullptr;
 
 // Push whatever LVGL rendered for `area` straight to the panel — synchronous,
-// no DMA hand-off. Simplest thing that works; pipboy_watch's own reasoning
+// no DMA hand-off. Simplest thing that works; esp32-watch-original's own reasoning
 // for drawing straight to the panel (easier to trust, easier to debug)
 // applies doubly for a first proof-of-concept.
 void lvglFlush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
@@ -110,8 +110,8 @@ void setup() {
   lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
 
   // Decorative progress ring — demonstrates LVGL's anti-aliased arc
-  // rendering, which pipboy_watch's hand-drawn circles (see
-  // drawWeatherIcon()/drawBigTempAt() in pipboy_watch.ino) can't match
+  // rendering, which esp32-watch-original's hand-drawn circles (see
+  // drawWeatherIcon()/drawBigTempAt() in esp32-watch-original.ino) can't match
   // without a lot more hand-written math.
   ring = lv_arc_create(screen);
   lv_obj_set_size(ring, 220, 220);
@@ -124,7 +124,7 @@ void setup() {
   lv_obj_add_event_cb(ring, onRingTapped, LV_EVENT_CLICKED, NULL);
 
   // Big clock label — Montserrat 48, proportional and anti-aliased, next to
-  // pipboy_watch's 7-segment Font7 digital-clock look. Not wired to real
+  // esp32-watch-original's 7-segment Font7 digital-clock look. Not wired to real
   // time (no WiFi/NTP here) — just ticks up from millis() to prove live
   // text updates render cleanly.
   clockLabel = lv_label_create(screen);
@@ -147,7 +147,7 @@ void loop() {
 
   // Fake running clock, just to prove label updates render live — this
   // sketch has no WiFi/NTP/BLE time source of its own. A real integration
-  // would reuse pipboy_watch's own time-sync code rather than reinvent it.
+  // would reuse esp32-watch-original's own time-sync code rather than reinvent it.
   static uint32_t lastClockMs = 0;
   uint32_t now = millis();
   if (now - lastClockMs >= 1000) {

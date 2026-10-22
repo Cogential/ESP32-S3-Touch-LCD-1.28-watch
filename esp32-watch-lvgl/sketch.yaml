@@ -2,7 +2,7 @@ default_profile: esp32s3
 
 profiles:
   esp32s3:
-    # Same FlashSize/PartitionScheme reasoning as pipboy_watch/sketch.yaml —
+    # Same FlashSize/PartitionScheme reasoning as esp32-watch-original/sketch.yaml —
     # without an explicit FlashSize, the bootloader's own flash-size field
     # stays at 4MB regardless of the partition table, and boot-loops the
     # board against the real 16MB chip.

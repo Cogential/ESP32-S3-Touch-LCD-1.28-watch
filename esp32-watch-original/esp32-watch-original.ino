@@ -1,4 +1,4 @@
-// PIP-BOY 3000 watch face for the Waveshare ESP32-S3-Touch-LCD-1.28
+// ESP32-WATCH watch face for the Waveshare ESP32-S3-Touch-LCD-1.28
 //
 // - Round GC9A01 display, green-phosphor CRT look, four screens (tap to
 //   cycle): STAT (clock + weather one-liner), DATA (steps), WEATHER (full
@@ -16,10 +16,10 @@
 // - Time comes from WiFi + NTP on boot (this board has no RTC chip), then
 //   WiFi is switched off to save power. Re-syncs periodically in case the
 //   software clock drifts. No SSID/password is hardcoded: WiFiManager opens
-//   a "PipBoy-Setup" WiFi hotspot + captive portal to pick a network the
+//   an "esp32-watch-setup" WiFi hotspot + captive portal to pick a network the
 //   first time (or whenever) it can't connect — long-press-and-hold on the
 //   STAT screen reopens it on demand, e.g. to switch onto a phone's hotspot.
-// - BLE peripheral "PIP-BOY 3000": bondable/pairable from Android's
+// - BLE peripheral "ESP32-WATCH": bondable/pairable from Android's
 //   Bluetooth settings, and speaks the open "Bangle.js" Nordic-UART JSON
 //   protocol that Gadgetbridge (free, open-source Android app) already
 //   knows how to talk — add this device in Gadgetbridge as a Bangle.js
@@ -59,12 +59,12 @@
 // ---------- WiFi / time ----------
 // No hardcoded SSID/password anymore — WiFiManager owns WiFi credentials
 // (stored in its own NVS blob, separate from Preferences). First boot with
-// nothing saved (or a failed connect) pops a "PipBoy-Setup" WiFi AP + captive
+// nothing saved (or a failed connect) pops an "esp32-watch-setup" WiFi AP + captive
 // portal to pick a network, same flow as most consumer IoT gadgets. A
 // long-press on the STAT screen re-opens that portal on demand, e.g. to
 // switch onto your phone's hotspot. See wifiConnectOrSetup() /
 // forceWifiSetupPortal() below.
-static const char *WIFI_SETUP_AP_NAME = "PipBoy-Setup";
+static const char *WIFI_SETUP_AP_NAME = "esp32-watch-setup";
 
 // ---------- long-press gestures ----------
 // This board has no physical power switch, and the long-press-and-hold
@@ -173,7 +173,7 @@ static const uint8_t PIN_TOUCH_INT = 5;
 static const uint8_t PIN_IMU_INT   = 4;
 static const uint8_t PIN_BATT_ADC  = 1;
 
-// ---------- Pip-Boy palette ----------
+// ---------- esp32-watch palette ----------
 static const uint16_t COL_BG        = lgfx::color565(0, 0, 0);
 static const uint16_t COL_GREEN     = lgfx::color565(85, 255, 110);   // bright phosphor
 // Reserved for icon outlines and state (an unconnected Bluetooth rune, the
@@ -354,7 +354,7 @@ float raiseGyroPeak = 0;        // fastest rotation seen during it, for calibrat
 uint32_t lastRaiseWakeMs = 0;   // last time raise-to-wake actually fired, for RAISE_COOLDOWN_MS
 
 // ---------- BLE ----------
-// Custom "Pip-Boy Time Service". The companion web page writes 4 bytes
+// Custom "esp32-watch Time Service". The companion web page writes 4 bytes
 // (little-endian uint32) of "local wall-clock epoch seconds" — i.e. it
 // already folds in the phone's timezone offset, so the watch can just
 // treat the value as the time to display, no timezone math needed here.
@@ -382,12 +382,12 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) override {
     bleConnected = true;
     forceRedraw = true;
-    Serial.println("[pipboy] BLE client connected.");
+    Serial.println("[esp32-watch] BLE client connected.");
   }
   void onDisconnect(BLEServer *s) override {
     bleConnected = false;
     forceRedraw = true;
-    Serial.println("[pipboy] BLE client disconnected, re-advertising.");
+    Serial.println("[esp32-watch] BLE client disconnected, re-advertising.");
     bleAdvertising->start(); // keep advertising so the phone can reconnect
   }
 };
@@ -465,7 +465,7 @@ void notifRemove(long id) {
 void handleGadgetbridgeLine(const String &line) {
   // Log every line that arrives, so "the phone isn't sending anything" is
   // distinguishable from "it's sending something we fail to parse".
-  Serial.printf("[pipboy] GB rx: %.120s\n", line.c_str());
+  Serial.printf("[esp32-watch] GB rx: %.120s\n", line.c_str());
 
   int stIdx = line.indexOf("setTime(");
   if (stIdx >= 0) {
@@ -478,7 +478,7 @@ void handleGadgetbridgeLine(const String &line) {
         settimeofday(&tv, nullptr);
         timeSynced = true;
         forceRedraw = true;
-        Serial.printf("[pipboy] time synced via BLE (Gadgetbridge): %ld\n", (long)epoch);
+        Serial.printf("[esp32-watch] time synced via BLE (Gadgetbridge): %ld\n", (long)epoch);
       }
     }
     return;
@@ -491,7 +491,7 @@ void handleGadgetbridgeLine(const String &line) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, line.substring(start, end + 1));
   if (err) {
-    Serial.printf("[pipboy] GB JSON parse failed: %s\n", err.c_str());
+    Serial.printf("[esp32-watch] GB JSON parse failed: %s\n", err.c_str());
     return;
   }
 
@@ -503,7 +503,7 @@ void handleGadgetbridgeLine(const String &line) {
              String((const char *)(doc["src"] | "")),
              String((const char *)(doc["title"] | "")),
              String((const char *)(doc["body"] | "")));
-    Serial.printf("[pipboy] notify id=%ld: %s / %s (%u held)\n",
+    Serial.printf("[esp32-watch] notify id=%ld: %s / %s (%u held)\n",
                   id, notifs[0].src.c_str(), notifs[0].title.c_str(), notifCount);
 
     // Pop the notification screen up for a few seconds, like a real watch,
@@ -522,7 +522,7 @@ void handleGadgetbridgeLine(const String &line) {
     long id = doc["id"] | 0L;
     notifRemove(id);
     forceRedraw = true;
-    Serial.printf("[pipboy] notification dismissed on phone: id=%ld (%u left)\n", id, notifCount);
+    Serial.printf("[esp32-watch] notification dismissed on phone: id=%ld (%u left)\n", id, notifCount);
 
   } else if (strcmp(type, "weather") == 0) {
     // Gadgetbridge's Bangle.js weather payload is
@@ -547,7 +547,7 @@ void handleGadgetbridgeLine(const String &line) {
     time_t nowEpoch = time(nullptr);
     weatherEpoch = (nowEpoch > 1700000000) ? nowEpoch : 0;
     saveWeather();
-    Serial.printf("[pipboy] weather: %dC (%s)\n", weatherTempC, weatherTxt.c_str());
+    Serial.printf("[esp32-watch] weather: %dC (%s)\n", weatherTempC, weatherTxt.c_str());
 
   } else if (strcmp(type, "musicinfo") == 0) {
     // Bangle.js "musicinfo": {t:"musicinfo", artist, album, track, dur, c, n}
@@ -557,7 +557,7 @@ void handleGadgetbridgeLine(const String &line) {
     musicTrack = String((const char *)(doc["track"] | ""));
     hasMusic = true;
     forceRedraw = true;
-    Serial.printf("[pipboy] musicinfo: %s - %s\n", musicArtist.c_str(), musicTrack.c_str());
+    Serial.printf("[esp32-watch] musicinfo: %s - %s\n", musicArtist.c_str(), musicTrack.c_str());
 
   } else if (strcmp(type, "musicstate") == 0) {
     // Bangle.js "musicstate": {t:"musicstate", state, position, shuffle, repeat}
@@ -568,7 +568,7 @@ void handleGadgetbridgeLine(const String &line) {
     musicPlaying = (strcmp(state, "play") == 0);
     hasMusic = true;
     forceRedraw = true;
-    Serial.printf("[pipboy] musicstate: %s\n", state);
+    Serial.printf("[esp32-watch] musicstate: %s\n", state);
   }
   // Other message types (notify-, findPhone, etc.) are ignored for now.
 }
@@ -590,7 +590,7 @@ class NUSRxCallbacks : public BLECharacteristicCallbacks {
 };
 
 void setupBLE() {
-  BLEDevice::init("Bangle.js Pip-Boy 3000"); // name must match Gadgetbridge's device-name allowlist
+  BLEDevice::init("Bangle.js esp32-watch"); // name must match Gadgetbridge's device-name allowlist
 
   // Default BLE TX power is +3dBm — plenty of range for a device that's
   // worn on the wrist next to a phone in the same pocket/room. 0dBm still
@@ -666,7 +666,7 @@ void sendMusicControl(const char *cmd) {
   int n = snprintf(buf, sizeof(buf), "Bangle.musicControl(\"%s\")\n", cmd);
   nusTxChar->setValue((uint8_t *)buf, n);
   nusTxChar->notify();
-  Serial.printf("[pipboy] sent music control: %s\n", cmd);
+  Serial.printf("[esp32-watch] sent music control: %s\n", cmd);
 }
 
 // ---------- WiFi / NTP time sync ----------
@@ -701,7 +701,7 @@ bool fetchNtpTime(uint32_t timeoutMs) {
 // never surprises you with a setup hotspot mid-day just because it's
 // temporarily out of range of home WiFi.
 bool syncTimeViaWifi(uint32_t timeoutMs) {
-  Serial.println("[pipboy] connecting to WiFi (saved credentials)...");
+  Serial.println("[esp32-watch] connecting to WiFi (saved credentials)...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(); // ESP-IDF replays the last SSID/pass it persisted to NVS
 
@@ -719,24 +719,24 @@ bool syncTimeViaWifi(uint32_t timeoutMs) {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[pipboy] WiFi connect failed/timed out.");
+    Serial.println("[esp32-watch] WiFi connect failed/timed out.");
     WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     return false;
   }
 
-  Serial.println("[pipboy] WiFi connected, fetching NTP time...");
+  Serial.println("[esp32-watch] WiFi connected, fetching NTP time...");
   bool gotTime = fetchNtpTime(8000);
 
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF); // save power — we don't need WiFi between syncs
 
   if (gotTime) {
-    Serial.println("[pipboy] NTP sync OK.");
+    Serial.println("[esp32-watch] NTP sync OK.");
     timeSynced = true;
     forceRedraw = true;
   } else {
-    Serial.println("[pipboy] NTP sync timed out.");
+    Serial.println("[esp32-watch] NTP sync timed out.");
   }
   return gotTime;
 }
@@ -788,20 +788,20 @@ bool wifiConnectOrSetup() {
   bool connected = wm.autoConnect(WIFI_SETUP_AP_NAME);
   if (bleAdvertising) bleAdvertising->start();
   if (!connected) {
-    Serial.println("[pipboy] WiFi setup portal timed out with no connection.");
+    Serial.println("[esp32-watch] WiFi setup portal timed out with no connection.");
     forceRedraw = true;
     return false;
   }
 
-  Serial.println("[pipboy] WiFi connected, fetching NTP time...");
+  Serial.println("[esp32-watch] WiFi connected, fetching NTP time...");
   bool gotTime = fetchNtpTime(8000);
   WiFi.disconnect(true, false);
   WiFi.mode(WIFI_OFF);
   if (gotTime) {
     timeSynced = true;
-    Serial.println("[pipboy] NTP sync OK.");
+    Serial.println("[esp32-watch] NTP sync OK.");
   } else {
-    Serial.println("[pipboy] NTP sync timed out.");
+    Serial.println("[esp32-watch] NTP sync timed out.");
   }
   forceRedraw = true;
   return gotTime;
@@ -825,16 +825,16 @@ bool forceWifiSetupPortal() {
 
   bool gotTime = false;
   if (connected) {
-    Serial.println("[pipboy] WiFi connected, fetching NTP time...");
+    Serial.println("[esp32-watch] WiFi connected, fetching NTP time...");
     gotTime = fetchNtpTime(8000);
     WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     if (gotTime) {
       timeSynced = true;
-      Serial.println("[pipboy] NTP sync OK.");
+      Serial.println("[esp32-watch] NTP sync OK.");
     }
   } else {
-    Serial.println("[pipboy] WiFi setup portal cancelled/timed out.");
+    Serial.println("[esp32-watch] WiFi setup portal cancelled/timed out.");
   }
   forceRedraw = true;
   return gotTime;
@@ -865,7 +865,7 @@ static const int BATT_MAX_PLAUSIBLE_MV = 4350; // above a full cell plus charge 
 // purpose — the goal is real margin before the cell gets anywhere near
 // whatever this board's one observed "won't power back on without a
 // physical battery reconnect" episode needed (see
-// pipboy-watch-battery-reconnect-fix in project memory), not to shave the
+// esp32-watch-battery-reconnect-fix in project memory), not to shave the
 // cutoff as close as the hardware allows. 3350mV sits just above the
 // lipoPercent() curve's own 0% floor (3300mV).
 static const int BATT_CRITICAL_MV = 3350;
@@ -921,11 +921,11 @@ int readBatteryPercent() {
     everRead = true;
     lastReadMs = now;
     if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
-      Serial.printf("[pipboy] battery: %dmV -> no plausible cell, reporting unknown\n", mv);
+      Serial.printf("[esp32-watch] battery: %dmV -> no plausible cell, reporting unknown\n", mv);
       cachedPct = BATT_UNKNOWN;
     } else {
       cachedPct = lipoPercent(mv);
-      Serial.printf("[pipboy] battery: %dmV -> %d%%\n", mv, cachedPct);
+      Serial.printf("[esp32-watch] battery: %dmV -> %d%%\n", mv, cachedPct);
     }
   }
   return cachedPct;
@@ -933,7 +933,7 @@ int readBatteryPercent() {
 
 // ---------- persistence ----------
 void loadState() {
-  prefs.begin("pipboy", false);
+  prefs.begin("esp32-watch", false);
   stepCounter.begin(prefs.getUInt("steps", 0));
   lastDayMarker = prefs.getUInt("dayMarker", 0);
 
@@ -959,7 +959,7 @@ void loadState() {
 }
 
 void saveWeather() {
-  prefs.begin("pipboy", false);
+  prefs.begin("esp32-watch", false);
   prefs.putULong("wEpoch", (uint32_t)weatherEpoch);
   prefs.putInt("wTemp", weatherTempC);
   prefs.putInt("wHi", weatherHiC);
@@ -996,7 +996,7 @@ void saveState() {
   uint32_t steps = stepCounter.count();
   if (steps == lastSavedSteps && lastDayMarker == lastSavedDayMarker) return;
 
-  prefs.begin("pipboy", false);
+  prefs.begin("esp32-watch", false);
   prefs.putUInt("steps", steps);
   prefs.putUInt("dayMarker", lastDayMarker);
   // stepHist only actually changes at day-rollover, which is exactly the
@@ -1033,9 +1033,9 @@ void setupPowerManagement() {
   };
   esp_err_t err = esp_pm_configure(&pmConfig);
   if (err == ESP_OK) {
-    Serial.println("[pipboy] automatic light sleep ENABLED.");
+    Serial.println("[esp32-watch] automatic light sleep ENABLED.");
   } else {
-    Serial.printf("[pipboy] esp_pm_configure() -> %s — not active (core likely lacks CONFIG_PM_ENABLE)\n",
+    Serial.printf("[esp32-watch] esp_pm_configure() -> %s — not active (core likely lacks CONFIG_PM_ENABLE)\n",
                    esp_err_to_name(err));
   }
 }
@@ -1096,7 +1096,7 @@ void powerDownAndDeepSleep() {
 }
 
 void enterDeepSleep() {
-  Serial.println("[pipboy] long-press -> entering deep sleep...");
+  Serial.println("[esp32-watch] long-press -> entering deep sleep...");
   saveState(); // catch any steps counted since the last periodic save
 
   // Say so on screen before going dark. Without this, sleeping looks
@@ -1127,13 +1127,13 @@ void enterDeepSleep() {
 // any current, since none of that is worth running at this state of
 // charge. This board has needed a physical battery-connector reconnect to
 // come back once already after running all the way down (see
-// pipboy-watch-battery-reconnect-fix in project memory) — whatever caused
+// esp32-watch-battery-reconnect-fix in project memory) — whatever caused
 // that, the actual fix is never letting the cell get that low again, not
 // hoping the recovery works better next time. Shows a brief warning first:
 // a watch that goes dark with no explanation reads as broken, which is
 // exactly the confusion that started this in the first place.
 void enterCriticalBatterySleep(int mv) {
-  Serial.printf("[pipboy] critical battery (%dmV) — sleeping immediately to protect the cell\n", mv);
+  Serial.printf("[esp32-watch] critical battery (%dmV) — sleeping immediately to protect the cell\n", mv);
 
   display.startWrite();
   display.fillScreen(COL_BG);
@@ -1212,14 +1212,14 @@ void updateRaiseToWake(bool accelOk, float ax, float ay, float az, uint32_t now)
     // guesses about how this IMU is mounted relative to "screen facing
     // you"; this is what turns them into measured values. ax/ay/az here is
     // the settled orientation at the end of the motion.
-    Serial.printf("[pipboy] raise? held=%lums peak=%.0fdps a=(%.1f,%.1f,%.1f) dot=%.2f dur=%d cool=%d\n",
+    Serial.printf("[esp32-watch] raise? held=%lums peak=%.0fdps a=(%.1f,%.1f,%.1f) dot=%.2f dur=%d cool=%d\n",
                   (unsigned long)heldMs, peak, ax, ay, az, dot,
                   durationLooksRight, offCooldown);
 
     if (durationLooksRight && offCooldown && dot > RAISE_ACCEL_DOT_MIN) {
       wakeScreen(now);
       lastRaiseWakeMs = now;
-      Serial.println("[pipboy] raise-to-wake triggered.");
+      Serial.println("[esp32-watch] raise-to-wake triggered.");
     }
   }
 }
@@ -2020,7 +2020,7 @@ String bootLines[BOOT_LOG_MAX];
 uint8_t bootLineCount = 0;
 
 void bootLog(const String &msg) {
-  Serial.printf("[pipboy] %s\n", msg.c_str());
+  Serial.printf("[esp32-watch] %s\n", msg.c_str());
 
   if (bootLineCount == BOOT_LOG_MAX) {
     for (uint8_t i = 1; i < BOOT_LOG_MAX; i++) bootLines[i - 1] = bootLines[i];
@@ -2106,7 +2106,7 @@ void render(bool fullClear) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[pipboy] boot");
+  Serial.println("\n[esp32-watch] boot");
 
   // Deep sleep (enterDeepSleep(), triggered by a long-press on the DATA
   // screen — this board's only "power button") is a full reset: everything
@@ -2115,7 +2115,7 @@ void setup() {
   // (flicker animation, WiFi+NTP round trip) instead of paying full boot
   // cost every time you just want to glance at the time.
   bool wokeFromSleep = (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0);
-  if (wokeFromSleep) Serial.println("[pipboy] waking from deep sleep (touch)...");
+  if (wokeFromSleep) Serial.println("[esp32-watch] waking from deep sleep (touch)...");
 
   // Load the DST-aware timezone rule unconditionally, independent of
   // WiFi — BLE time sync (from Gadgetbridge, see handleGadgetbridgeLine)
@@ -2133,9 +2133,9 @@ void setup() {
   setCpuFrequencyMhz(80);
   setupPowerManagement();
 
-  Serial.println("[pipboy] display.init()...");
+  Serial.println("[esp32-watch] display.init()...");
   bool dispOk = display.init();
-  Serial.printf("[pipboy] display.init() -> %d\n", dispOk);
+  Serial.printf("[esp32-watch] display.init() -> %d\n", dispOk);
   display.setRotation(1); // 90° clockwise
   display.setBrightness(BRIGHT_ACTIVE);
   lastActivityMs = millis();
@@ -2148,7 +2148,7 @@ void setup() {
   display.fillScreen(COL_BG);
   display.endWrite();
   if (!wokeFromSleep) {
-    bootLog("> PIP-BOY 3000");
+    bootLog("> ESP32-WATCH");
     bootLog("> RobCo Industries");
     bootLog(dispOk ? "> display....OK" : "> display..FAIL");
   }
@@ -2163,7 +2163,7 @@ void setup() {
   for (uint8_t addr = 0x08; addr < 0x78; addr++) {
     Wire.beginTransmission(addr);
     if (Wire.endTransmission() == 0) {
-      Serial.printf("[pipboy]   found device at 0x%02X\n", addr);
+      Serial.printf("[esp32-watch]   found device at 0x%02X\n", addr);
       if (!wokeFromSleep) {
         char line[24];
         snprintf(line, sizeof(line), "  found 0x%02X", addr);
@@ -2174,14 +2174,14 @@ void setup() {
 
   for (int attempt = 1; attempt <= 4 && !touchOk; attempt++) {
     touchOk = touch.begin(Wire, PIN_TOUCH_RST, PIN_TOUCH_INT);
-    Serial.printf("[pipboy] touch.begin() attempt %d -> %d\n", attempt, touchOk);
+    Serial.printf("[esp32-watch] touch.begin() attempt %d -> %d\n", attempt, touchOk);
     if (!touchOk) delay(150);
   }
   if (!wokeFromSleep) bootLog(touchOk ? "> touch......OK" : "> touch....FAIL");
 
-  Serial.println("[pipboy] probing IMU...");
+  Serial.println("[esp32-watch] probing IMU...");
   imuOk = imu.begin(Wire, QMI8658_ADDRESS_HIGH) || imu.begin(Wire, QMI8658_ADDRESS_LOW);
-  Serial.printf("[pipboy] imu.begin() -> %d\n", imuOk);
+  Serial.printf("[esp32-watch] imu.begin() -> %d\n", imuOk);
   if (imuOk) {
     imu.enableAccel(true);
     imu.setAccelRange(QMI8658_ACCEL_RANGE_4G);
@@ -2237,13 +2237,13 @@ void setup() {
     // quick glance well within the interval), which is the whole point of
     // the fast-wake path — it just no longer skips it *forever*.
     if (wifiResyncDue(WAKE_RESYNC_INTERVAL_SEC)) {
-      Serial.println("[pipboy] wake: resync due, trying a quick WiFi reconnect...");
+      Serial.println("[esp32-watch] wake: resync due, trying a quick WiFi reconnect...");
       rtcLastSyncAttemptEpoch = time(nullptr); // stamp before attempting — throttles retries even on failure
       bool resynced = syncTimeViaWifi(8000);   // saved creds only, no portal — same as loop()'s periodic resync
       wifiOk = resynced || timeSynced;         // a failed attempt doesn't invalidate a clock that was already fine
     } else {
       wifiOk = timeSynced;
-      Serial.println("[pipboy] wake: recently synced, skipping WiFi.");
+      Serial.println("[esp32-watch] wake: recently synced, skipping WiFi.");
     }
 
     // Vault Boy on every wake now, not just cold boot — costs the ~0.85s
@@ -2274,7 +2274,7 @@ void setup() {
   // Skip the settle delay on a sleep wake — the whole point of that path is
   // getting back to something useful on screen as fast as possible.
   if (!wokeFromSleep) delay(200);
-  Serial.println("[pipboy] PIP-BOY 3000 online.");
+  Serial.println("[esp32-watch] ESP32-WATCH online.");
 }
 
 void loop() {
@@ -2303,7 +2303,7 @@ void loop() {
       // turns that into a measurement. Turn off once calibrated.
       if (IMU_TRACE && now - lastImuTraceMs >= 1000) {
         lastImuTraceMs = now;
-        Serial.printf("[pipboy] imu a=(%.1f,%.1f,%.1f) g=(%.0f,%.0f,%.0f) dim=%d\n",
+        Serial.printf("[esp32-watch] imu a=(%.1f,%.1f,%.1f) g=(%.0f,%.0f,%.0f) dim=%d\n",
                       ax, ay, az, gyroX, gyroY, gyroZ, backlightDimmed);
       }
     }
@@ -2326,7 +2326,7 @@ void loop() {
       uint32_t finished = stepCounter.count(); // the day that's ending, before it's wiped
       for (uint8_t i = 0; i + 1 < 6; i++) stepHist[i] = stepHist[i + 1]; // drop the oldest
       stepHist[5] = finished; // most recently completed day, for the HISTORY screen
-      Serial.printf("[pipboy] new day (%lu -> %lu), resetting steps (yesterday: %lu)\n",
+      Serial.printf("[esp32-watch] new day (%lu -> %lu), resetting steps (yesterday: %lu)\n",
                     (unsigned long)lastDayMarker, (unsigned long)today, (unsigned long)finished);
       stepCounter.set(0);
       lastDayMarker = today;
@@ -2403,7 +2403,7 @@ void loop() {
         int16_t visualScroll = SWIPE_AXIS_IS_RAW_Y ? rawDx : rawDy;
         if (VSWIPE_INVERT) visualScroll = -visualScroll;
 
-        Serial.printf("[pipboy] lift: held=%lums dx=%d dy=%d screen=%u dimWake=%d\n",
+        Serial.printf("[esp32-watch] lift: held=%lums dx=%d dy=%d screen=%u dimWake=%d\n",
                       (unsigned long)heldMs, rawDx, rawDy, currentScreen, touchWasDimWake);
 
         bool scrollGesture = !touchWasDimWake && abs(visualScroll) >= SWIPE_MIN_DIST &&
@@ -2468,7 +2468,7 @@ void loop() {
             saveState();
             stepsResetArmedMs = 0;
             stepsResetTaps = 0;
-            Serial.println("[pipboy] steps reset by user.");
+            Serial.println("[esp32-watch] steps reset by user.");
           }
           forceRedraw = true;
 
@@ -2514,7 +2514,7 @@ void loop() {
           // resting object never lifts, so release-triggering can't be
           // fooled by one; the upper bound covers it eventually being
           // removed.
-          Serial.printf("[pipboy] long-press released after %lums on screen %u\n",
+          Serial.printf("[esp32-watch] long-press released after %lums on screen %u\n",
                         (unsigned long)heldMs, currentScreen);
           if (heldMs < SLEEP_PRESS_MAX_MS) {
             enterDeepSleep(); // never returns — next code that runs is setup()
@@ -2586,7 +2586,7 @@ void loop() {
   // falling asleep mid-use would be a strange way for a torch to behave.
   if (touchOk && AUTO_SLEEP_TIMEOUT_MS && !swRunning && !timerRunning && !isFlashlightNow &&
       now - lastActivityMs > AUTO_SLEEP_TIMEOUT_MS) {
-    Serial.println("[pipboy] idle timeout -> deep sleep");
+    Serial.println("[esp32-watch] idle timeout -> deep sleep");
     enterDeepSleep(); // never returns
   }
 
@@ -2635,7 +2635,7 @@ void loop() {
     timerFiredMs = now;
     currentScreen = SCREEN_TIMER;
     wakeScreen(now);
-    Serial.println("[pipboy] timer expired.");
+    Serial.println("[esp32-watch] timer expired.");
   }
 
   // The armed step-reset prompt expires on its own; repaint once when it

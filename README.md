@@ -2,7 +2,7 @@
 
 Firmware for a Waveshare **ESP32-S3-Touch-LCD-1.28** (round 240×240 GC9A01
 panel, CST816S capacitive touch, QMI8658 accel+gyro, no RTC, no physical
-power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
+power button) turned into a Fallout-styled wrist watch.
 
 ## Phone setup: Gadgetbridge
 
@@ -12,11 +12,11 @@ drives it: time, notifications, weather and music.
 
 1. **Install Gadgetbridge** on the phone, from F-Droid or Google Play.
 2. **Flash and power on the watch.** It advertises over Bluetooth as
-   **"Bangle.js Pip-Boy 3000"**. Keep that name if you change the firmware:
+   **"Bangle.js esp32-watch"**. Keep that name if you change the firmware:
    Gadgetbridge picks the device type from the name, and anything not
    starting "Bangle.js" won't be offered as one.
 3. **Pair it in Gadgetbridge:** tap **+** (add device), let it scan, and pick
-   "Bangle.js Pip-Boy 3000". Pairing is "Just Works", so there's no PIN to
+   "Bangle.js esp32-watch". Pairing is "Just Works", so there's no PIN to
    type. Once connected, Gadgetbridge sets the watch's clock automatically on
    every connect, which keeps the time right when Wi-Fi isn't around.
 4. **Give Gadgetbridge notification access** (Android Settings, then
@@ -40,23 +40,31 @@ What you get on the watch:
 - **Find phone**: SETTINGS (swipe up on the clock face), then "Find phone",
   rings the phone. Tap again to stop.
 - **Wi-Fi time sync** is separate from Gadgetbridge: on first boot, or when
-  no saved network is in range, the watch opens a "PipBoy-Setup" Wi-Fi
+  no saved network is in range, the watch opens an "esp32-watch-setup" Wi-Fi
   hotspot to choose a network. To open it again on demand, hold a finger
   still on the screen for 6-12 seconds (3-6 seconds puts the watch to sleep).
 
 ### Weather app
 
-TODO: which weather app, and how its Gadgetbridge option is set up.
+I use [Breezy Weather](https://f-droid.org/packages/org.breezyweather/)
+(F-Droid or Google Play).
+
+1. Install Breezy Weather and add your location. The first location in its
+   list is the one the watch shows.
+2. In Breezy Weather, open **Settings → External modules → Send Gadgetbridge
+   data** and turn on **Gadgetbridge**.
+3. Weather then reaches the watch whenever Breezy refreshes. The watch keeps
+   the last report through sleep and reboots.
 
 ## Hardware
 
 - **Board:** Waveshare ESP32-S3-Touch-LCD-1.28 (see top of this file).
-- **Battery:** TODO.
-- **Case:** TODO, the 3D model used to hold the board and battery.
+- **Battery:** 500mAh single-cell LiPo on the board's JST battery connector.
+- **Case:** 3D-printed, from [this Thingiverse model](https://www.thingiverse.com/thing:7395111).
 
 ## Projects in this repo
 
-- **`pipboy_watch/`** — the working Pip-Boy watch face firmware. Hand-drawn
+- **`esp32-watch-original/`** — the working esp32-watch watch face firmware. Hand-drawn
   monochrome CRT-green UI, built directly on LovyanGFX with no GUI toolkit.
   This is the "keep as-is" project — see below.
 - **`lvgl_watch/`** — a separate, minimal LVGL v9 proof-of-concept on the
@@ -64,15 +72,15 @@ TODO: which weather app, and how its Gadgetbridge option is set up.
   enough to prove the render + touch pipeline works and show what a real
   widget toolkit looks like on this panel. Confirmed running on the actual
   board.
-- **`pipboy_lvgl/`** — a full port of every `pipboy_watch/` feature onto
-  LVGL widgets. See [below](#pipboy_lvgl--full-lvgl-port) for what's reused
+- **`esp32-watch-lvgl/`** — a full port of every `esp32-watch-original/` feature onto
+  LVGL widgets. See [below](#esp32-watch-lvgl--full-lvgl-port) for what's reused
   vs. rebuilt and what's still unverified. Built, flashed and confirmed
   working on the real board.
 - See [Exploring a richer UI](#exploring-a-richer-ui) below for the
-  reasoning behind both. Nothing here has touched `pipboy_watch/` — it's
+  reasoning behind both. Nothing here has touched `esp32-watch-original/` — it's
   unchanged.
 
-## `pipboy_watch/` — feature summary
+## `esp32-watch-original/` — feature summary
 
 - **Screens** (swipe to cycle): STAT (clock + date + weather one-liner +
   notification banner), DATA (today's steps), HISTORY (7-day step bar
@@ -80,7 +88,7 @@ TODO: which weather app, and how its Gadgetbridge option is set up.
   (now-playing from the phone), STOPWATCH, TIMER, FLASHLIGHT (solid white,
   max brightness).
 - **Time**: WiFi + NTP on first boot (WiFiManager captive portal —
-  "PipBoy-Setup" — if no saved network), then WiFi is switched off. Periodic
+  "esp32-watch-setup" — if no saved network), then WiFi is switched off. Periodic
   resync while awake; a lighter, shorter-threshold resync on waking from
   deep sleep (see "Power" below). Also settable over BLE — Gadgetbridge
   pushes real time on every connect, so the clock stays correct even with
@@ -90,15 +98,15 @@ TODO: which weather app, and how its Gadgetbridge option is set up.
   history (persisted in NVS) for the HISTORY screen's bar chart.
 - **Raise-to-wake**: gyro+accel heuristic, calibrated against logged
   readings from the real board (see the comments above
-  `updateRaiseToWake()` in `pipboy_watch.ino` — two earlier calibration
+  `updateRaiseToWake()` in `esp32-watch-original.ino` — two earlier calibration
   attempts got the axis/orientation wrong before this one was measured
   correctly).
-- **Bluetooth**: BLE peripheral named "Bangle.js Pip-Boy 3000" — speaks the
+- **Bluetooth**: BLE peripheral named "Bangle.js esp32-watch" — speaks the
   open Bangle.js/Nordic-UART JSON protocol that Gadgetbridge (free,
   open-source Android app) already knows how to talk to. Add it in
   Gadgetbridge as a Bangle.js watch to get notifications, weather, and
   now-playing music forwarded with no custom phone app. Also exposes a
-  small custom "Pip-Boy Time Service" for a companion web page to set the
+  small custom "esp32-watch Time Service" for a companion web page to set the
   clock directly.
 - **Music control**: MUSIC screen shows track/artist from Gadgetbridge's
   `musicinfo`/`musicstate` messages; tapping sends a play/pause command
@@ -160,7 +168,7 @@ TODO: which weather app, and how its Gadgetbridge option is set up.
   200k/100k divider and a perfectly-calibrated ADC with no correction for
   either. Needs an independent multimeter reading compared against the
   Serial-logged `battery: XXXXmV` value to tell which.
-  **`pipboy_lvgl` works around it (2026-10-21):** its gauge filters the
+  **`esp32-watch-lvgl` works around it (2026-10-21):** its gauge filters the
   reading (5s samples, ~40s low-pass that survives deep sleep), moves the
   shown % only for ≥2% changes at 1% per 15s, and scales the curve so the
   highest filtered reading ever seen counts as 100% (NVS `battMax`,
@@ -175,12 +183,12 @@ TODO: which weather app, and how its Gadgetbridge option is set up.
 ## Build / flash
 
 ```
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M pipboy_watch
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M esp32-watch-original
 ./bin/arduino-cli board list                      # find the port, e.g. /dev/ttyACM0
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M --upload -p /dev/ttyACM0 pipboy_watch
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M --upload -p /dev/ttyACM0 esp32-watch-original
 ```
 
-Library/platform versions are pinned in `pipboy_watch/sketch.yaml`.
+Library/platform versions are pinned in `esp32-watch-original/sketch.yaml`.
 `FlashSize=16M` must stay paired with the `PartitionScheme` — the
 bootloader's own flash-size field doesn't otherwise pick up the board's
 real 16MB chip, and the mismatch boot-loops it.
@@ -190,13 +198,13 @@ real 16MB chip, and the mismatch boot-loops it.
 The stock example software this board ships with (Waveshare's
 `LVGL_Arduino` demo) uses **LVGL v8.3.10** on top of **TFT_eSPI v2.5.34** to
 get a benchmark-style widget UI with real animations, anti-aliased fonts,
-and image support — a different tier of UI than `pipboy_watch/`'s
+and image support — a different tier of UI than `esp32-watch-original/`'s
 hand-drawn screens.
 
 Recommended path for a second, separate project in this repo:
 
 - **Keep LovyanGFX as the panel driver**, don't switch to TFT_eSPI. The
-  pin configuration in `pipboy_watch/LGFX_Config.hpp` is already verified
+  pin configuration in `esp32-watch-original/LGFX_Config.hpp` is already verified
   against real hardware (schematic-checked, not guessed) — re-deriving it
   under a different driver library would be repeating exactly the kind of
   hardware guess that's bitten this project before. LVGL doesn't care which
@@ -220,16 +228,16 @@ Recommended path for a second, separate project in this repo:
 ### `lvgl_watch/` — what's actually there
 
 Went with full LVGL. **Compiles clean** (23% flash, 39% RAM — LVGL's
-render buffers account for the jump from `pipboy_watch`'s 15% RAM, still
+render buffers account for the jump from `esp32-watch-original`'s 15% RAM, still
 comfortable headroom either way) and **confirmed running on the real
 board** — this proof-of-concept was the basis for going ahead with the
-full `pipboy_lvgl/` port below.
+full `esp32-watch-lvgl/` port below.
 
 - LVGL **v9.5.0** (the version Arduino's Library Manager actually serves
   now — see the note in `lvgl_watch/sketch.yaml` for why v9 was chosen
   over v8.3, which most existing tutorials still target).
 - `LGFX_Config.hpp` and `Touch_CST816S.h` are copied unchanged from
-  `pipboy_watch/` — same already-verified pin wiring, not re-derived.
+  `esp32-watch-original/` — same already-verified pin wiring, not re-derived.
 - `lv_conf.h` is LVGL's own stock template with exactly two changes: the
   top `#if 0` flipped to `#if 1` to enable it, and the Montserrat 32/48
   fonts turned on for a legible clock face. Everything else is default.
@@ -238,30 +246,30 @@ full `pipboy_lvgl/` port below.
   just registering *somewhere* on the panel) and a big proportional-font
   clock label. The clock is **not wired to real time** — no WiFi/NTP/BLE
   in this sketch — it just counts up from `millis()` to prove live label
-  updates render cleanly. A real integration would reuse pipboy_watch's
+  updates render cleanly. A real integration would reuse esp32-watch-original's
   own time-sync code rather than reinvent it.
 - **Known limitation, not yet solved**: the panel is left unrotated
-  (`display.setRotation(1)` from `pipboy_watch` is *not* called here).
+  (`display.setRotation(1)` from `esp32-watch-original` is *not* called here).
   `Touch_CST816S.h` reports raw, unrotated panel coordinates, and getting
   those to line up with a rotated display needs a coordinate remap that
-  pipboy_watch never had to solve (it only reads swipe deltas and tap/hold
+  esp32-watch-original never had to solve (it only reads swipe deltas and tap/hold
   duration, never an absolute tap position). Rotating this to match
-  pipboy_watch's upright orientation is follow-up work.
+  esp32-watch-original's upright orientation is follow-up work.
 
-Build/flash the same way as `pipboy_watch/`, substituting the folder name:
+Build/flash the same way as `esp32-watch-original/`, substituting the folder name:
 
 ```
 ./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M lvgl_watch
 ./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M --upload -p <port> lvgl_watch
 ```
 
-### `pipboy_lvgl/` — full LVGL port
+### `esp32-watch-lvgl/` — full LVGL port
 
-Started as a port of every `pipboy_watch/` screen onto LVGL widgets, and
+Started as a port of every `esp32-watch-original/` screen onto LVGL widgets, and
 has since diverged into its own design. **Confirmed working on the real
 board** — touch, navigation, every screen, and the Gadgetbridge
 integration have all been tested live, not just compiled. See
-[[pipboy-lvgl-port]] in project memory for the real, hardware-confirmed
+[[esp32-watch-lvgl-port]] in project memory for the real, hardware-confirmed
 bugs found and fixed along the way (an integer-underflow sleep-on-touch
 bug, an LVGL/LovyanGFX RGB565 byte-order mismatch, a touch-coordinate
 Y-inversion that made every button unclickable, and the verified
@@ -271,7 +279,7 @@ Gadgetbridge music protocol).
 and FLASHLIGHT were removed by request, and on 2026-10-21 so were DATA
 (steps), HISTORY (7-day steps) and STOPWATCH, along with the pedometer, the
 BLE steps characteristic and the step reports to Gadgetbridge.
-`pipboy_watch/` still has all of them if any needs reviving.
+`esp32-watch-original/` still has all of them if any needs reviving.
 
 **Navigation is entirely button-driven** — swipe-to-cycle is gone. STAT
 carries three curved nav bands hugging the panel edge (2026-10-21): music on
@@ -332,7 +340,7 @@ the *top* of `setup()` here rather than after the boot sequence — see the
 comment there for why that stays conflict-free with the raw-LovyanGFX
 WiFi-portal and sleep screens.
 
-**Reused wholesale, unchanged**, from `pipboy_watch.ino`: WiFi/NTP sync and
+**Reused wholesale, unchanged**, from `esp32-watch-original.ino`: WiFi/NTP sync and
 the WiFiManager captive portal, BLE setup and the entire Gadgetbridge
 message parser (notify/weather/musicinfo/musicstate/setTime), the battery
 curve and critical-battery shutdown, NVS persistence, raise-to-wake's IMU
@@ -354,7 +362,7 @@ reused essentially verbatim, just triggered from LVGL's press/release/
 gesture events instead of a hand-rolled polling loop.
 
 **New**: the whole screen layer, built as LVGL widgets — labels, a scrollable snap-list for notifications
-(replacing pipboy_watch's index-paged list), LVGL's built-in symbol glyphs
+(replacing esp32-watch-original's index-paged list), LVGL's built-in symbol glyphs
 (`LV_SYMBOL_BATTERY_*`, `LV_SYMBOL_BLUETOOTH`, `LV_SYMBOL_PLAY`/`PAUSE`) in
 place of the hand-drawn battery/Bluetooth icons, and a tiled,
 alpha-blended CRT scanline texture on `lv_layer_top()` so it covers every
@@ -385,6 +393,6 @@ for the exact permission path, including a known Android 13+/F-Droid
 Build/flash identically:
 
 ```
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled pipboy_lvgl
-./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled --upload -p <port> pipboy_lvgl
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled esp32-watch-lvgl
+./bin/arduino-cli compile --fqbn esp32:esp32:esp32s3:PartitionScheme=app3M_fat9M_16MB,FlashSize=16M,PSRAM=enabled --upload -p <port> esp32-watch-lvgl
 ```
