@@ -970,36 +970,126 @@ int lipoPercent(int mv) {
   return 0;
 }
 
-// Shared by readBatteryPercent() and the critical-battery check in setup()
-// — same 8-sample average and 200k/100k divider scaling either way, so the
-// two can't ever disagree about what the cell's actual voltage is.
-// Averaged because a single ESP32 ADC read carries several tens of mV of
-// noise, which on a LiPo curve is worth a percent or two of jitter —
-// enough to make the displayed number wander while nothing is happening.
+// Shared by the gauge below and the critical-battery check in setup(), so
+// the two can't disagree about the raw voltage. 16 samples averaged after
+// one discarded read: a single ESP32 ADC read carries tens of mV of noise,
+// and the first read after idle settles slowly through the 200k/100k
+// divider's high source impedance.
 int readBatteryMilliVolts() {
+  analogReadMilliVolts(PIN_BATT_ADC);
   uint32_t acc = 0;
-  for (uint8_t i = 0; i < 8; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
-  return (int)(acc / 8) * 3; // 200k/100k divider
+  for (uint8_t i = 0; i < 16; i++) acc += analogReadMilliVolts(PIN_BATT_ADC);
+  return (int)(acc / 16) * 3; // 200k/100k divider
+}
+
+// ---------- battery gauge ----------
+// The number on screen used to be one 8-sample reading every 30s pushed
+// straight through the curve, which made it jump around: the reading moves
+// with the load (backlight, BLE, WiFi), every wake from deep sleep is a
+// fresh boot with no history, and the top of the curve is steep (4.0-4.2V
+// is 80-100%). And it never reached 100% because this board reads a full
+// cell low: logged charges topped out around 4.07-4.10V, not 4.2V.
+//
+// So now:
+// - the raw reading is taken every 5s and low-pass filtered (time constant
+//   ~40s), and the filter survives deep sleep in RTC memory;
+// - the shown percentage only moves when the filtered value is >= 2% away
+//   (no flicker between two neighbours), one step per 15s, except that it
+//   snaps to a big change on wake (charged while asleep) and to 0/100;
+// - the curve is scaled so the highest filtered reading ever seen
+//   (battMaxSeenMv, kept in NVS) counts as full, clamped to 4050-4200mV so a
+//   partial charge can't be mistaken for full and a floating no-battery
+//   node can't push it past the stock curve. Until one full charge has been
+//   seen the full point sits at the 4050mV floor. Scaling suits the likely
+//   cause, a gain error from divider tolerance / ADC loading.
+//
+// It still can't tell charging from discharging: the charger's STAT pin
+// isn't wired to a GPIO on this board, and while charging the reading sits
+// above the true state of charge (charge current across the cell's
+// resistance), so expect it to reach 100% a little early on the charger.
+static const uint32_t BATT_SAMPLE_MS = 5000;
+static const uint32_t BATT_STEP_MS = 15000;    // fastest the shown % moves
+static const int BATT_FILTER_DIV = 8;          // EMA weight 1/8 at 5s samples ≈ 40s
+static const int BATT_WAKE_SNAP_MV = 60;       // wake reading this far off the saved filter: start over
+static const int BATT_CURVE_FULL_MV = 4200;   // lipoPercent()'s own 100% point
+static const int BATT_FULL_MIN_MV = 4050;
+static const int BATT_FULL_MAX_MV = 4200;
+
+RTC_DATA_ATTR int rtcBattFilteredMv = 0; // 0 = no history (cold boot)
+RTC_DATA_ATTR int rtcBattShownPct = BATT_UNKNOWN;
+int battMaxSeenMv = 0;      // loaded in loadState()
+int battMaxSavedMv = 0;
+
+int battFullMv() {
+  return constrain(battMaxSeenMv, BATT_FULL_MIN_MV, BATT_FULL_MAX_MV);
+}
+
+int battPercentFromMv(int mv) {
+  return lipoPercent((int)((int32_t)mv * BATT_CURVE_FULL_MV / battFullMv()));
 }
 
 int readBatteryPercent() {
-  static int cachedPct = BATT_UNKNOWN;
-  static uint32_t lastReadMs = 0;
-  static bool everRead = false;
+  static uint32_t lastSampleMs = 0, lastStepMs = 0, lastLogMs = 0;
+  static bool sampled = false;
   uint32_t now = millis();
-  if (!everRead || now - lastReadMs > 30000) {
-    int mv = readBatteryMilliVolts();
-    everRead = true;
-    lastReadMs = now;
-    if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
+  if (sampled && now - lastSampleMs < BATT_SAMPLE_MS) return rtcBattShownPct;
+
+  bool first = !sampled;
+  sampled = true;
+  lastSampleMs = now;
+  int mv = readBatteryMilliVolts();
+  if (mv < BATT_MIN_PLAUSIBLE_MV || mv > BATT_MAX_PLAUSIBLE_MV) {
+    if (now - lastLogMs > 30000 || first) {
+      lastLogMs = now;
       Serial.printf("[pipboy] battery: %dmV -> no plausible cell, reporting unknown\n", mv);
-      cachedPct = BATT_UNKNOWN;
-    } else {
-      cachedPct = lipoPercent(mv);
-      Serial.printf("[pipboy] battery: %dmV -> %d%%\n", mv, cachedPct);
+    }
+    rtcBattFilteredMv = 0;
+    rtcBattShownPct = BATT_UNKNOWN;
+    return BATT_UNKNOWN;
+  }
+
+  bool snap = false;
+  if (rtcBattFilteredMv == 0 || (first && abs(mv - rtcBattFilteredMv) > BATT_WAKE_SNAP_MV)) {
+    rtcBattFilteredMv = mv;
+    snap = true;
+  } else {
+    int d = mv - rtcBattFilteredMv;
+    rtcBattFilteredMv += (d + (d > 0 ? BATT_FILTER_DIV / 2 : -BATT_FILTER_DIV / 2)) / BATT_FILTER_DIV; // rounded
+  }
+  int filt = rtcBattFilteredMv;
+
+  // Learn the full point from the filtered value, never a single sample.
+  // Saved in 5mV steps, so NVS sees a few dozen writes over the watch's life.
+  if (filt > battMaxSeenMv && battMaxSeenMv < BATT_FULL_MAX_MV) {
+    battMaxSeenMv = min(filt, BATT_FULL_MAX_MV);
+    if (battMaxSeenMv - battMaxSavedMv >= 5) {
+      prefs.begin("pipboy", false);
+      prefs.putInt("battMax", battMaxSeenMv);
+      prefs.end();
+      battMaxSavedMv = battMaxSeenMv;
+      Serial.printf("[pipboy] battery: highest reading now %dmV (full point %dmV)\n",
+                    battMaxSeenMv, battFullMv());
     }
   }
-  return cachedPct;
+
+  int target = battPercentFromMv(filt);
+  if (snap || rtcBattShownPct == BATT_UNKNOWN) {
+    rtcBattShownPct = target;
+    lastStepMs = now;
+  } else if (now - lastStepMs >= BATT_STEP_MS) {
+    int diff = target - rtcBattShownPct;
+    if (abs(diff) >= 2 || ((target == 100 || target == 0) && diff != 0)) {
+      rtcBattShownPct += (diff > 0) ? 1 : -1;
+      lastStepMs = now;
+    }
+  }
+
+  if (first || now - lastLogMs > 30000) {
+    lastLogMs = now;
+    Serial.printf("[pipboy] battery: raw %dmV filt %dmV full %dmV -> %d%% (showing %d%%)\n",
+                  mv, filt, battFullMv(), target, rtcBattShownPct);
+  }
+  return rtcBattShownPct;
 }
 
 // ---------- persistence ----------
@@ -1011,6 +1101,9 @@ void loadState() {
     prefs.remove("dayMarker");
     prefs.remove("stepHist");
   }
+
+  // Battery gauge's highest reading seen — see the battery gauge section.
+  battMaxSeenMv = battMaxSavedMv = constrain(prefs.getInt("battMax", 0), 0, BATT_FULL_MAX_MV);
 
   // User settings — each falls back to the compile-time default if unset.
   cfgBrightness = (uint8_t)prefs.getUChar("cfgBright", BRIGHT_ACTIVE);
