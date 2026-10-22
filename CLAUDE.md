@@ -73,7 +73,7 @@ There are no tests or linters: verification means compiling, then flashing and c
 - **Steps, 7-day history and the stopwatch were removed by request** (screens, pedometer, BLE steps
   characteristic, Gadgetbridge `act` reports, NVS step keys, which `loadState()` deletes). Don't bring them
   back unasked. Screens are now STAT, WEATHER, NOTIF, MUSIC, SETTINGS; STAT's nav is three curved bands
-  around the edge (`makeNavBand()`: music left, notifications top, weather right). The IMU is only polled while dimmed (raise-to-wake is its only user).
+  around the edge (`makeNavBand()`: music left, notifications top, weather right); SETTINGS opens with a swipe down on STAT (it was swipe up). The IMU is only polled while dimmed (raise-to-wake is its only user).
 - **Battery gauge** (`// ---------- battery gauge ----------`): filtered and rate-limited, with the full point
   learned from the highest filtered reading (NVS `battMax`, clamped 4050-4200mV) because this board reads a
   full cell low. The critical-battery check in `setup()` deliberately still uses the raw reading. The serial

@@ -37,7 +37,7 @@ What you get on the watch:
   you dismiss them on the phone (the watch removes them too).
 - **Music**: track, artist and a progress ring, with previous / play-pause /
   next buttons that control the phone.
-- **Find phone**: SETTINGS (swipe up on the clock face), then "Find phone",
+- **Find phone**: SETTINGS (drag down from the clock in the middle of the face), then "Find phone",
   rings the phone. Tap again to stop.
 - **Wi-Fi time sync** is separate from Gadgetbridge: on first boot, or when
   no saved network is in range, the watch opens an "esp32-watch-setup" Wi-Fi
@@ -286,8 +286,8 @@ carries three curved nav bands hugging the panel edge (2026-10-21): music on
 the left, notifications at the top, weather on the right, each a 60° outlined
 arc (`makeNavBand()`) that fills in when pressed (the bell's also fills while
 notifications wait). Every other
-screen has an identical back button at bottom centre. Swiping up on the
-clock face opens SETTINGS, which deliberately has no nav band.
+screen has an identical back button at bottom centre. Dragging down from the
+clock in the middle opens SETTINGS, which deliberately has no nav band.
 Screens change with the **melt transition** described below.
 
 **Screen melt transition** (`playMelt()`): LVGL ships eight slide variants
@@ -311,8 +311,8 @@ bypassing LVGL for the ~0.35s it runs. Two consequences worth knowing:
   not assumed. It claims GPIO 35-37, which nothing on this board uses.
   If allocation ever fails, `meltReady` stays false and `goToScreen()`
   falls back to the stock slides, which still encode direction (sections
-  drop from the top, the clock slides back up, settings rises from the
-  bottom to match its swipe).
+  drop from the top, the clock slides back up, settings drops from the
+  top to match its swipe).
 - **SPI was raised 40MHz → 80MHz.** The melt is bandwidth-bound: one
   115KB frame is 23ms at 40MHz and ~11ms at 80MHz. Measured on hardware,
   this took a transition from ~600ms to ~350ms (≈19 frames at ~20ms).

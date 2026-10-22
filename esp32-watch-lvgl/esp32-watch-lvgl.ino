@@ -2,7 +2,7 @@
 //
 // - Round GC9A01 display, green-phosphor CRT look. STAT (clock + weather
 //   one-liner) has a nav ring to WEATHER, NOTIF and MUSIC; SETTINGS is a
-//   swipe up. Steps, step history and the stopwatch were removed by request.
+//   swipe down. Steps, step history and the stopwatch were removed by request.
 // - The onboard QMI8658 IMU (accel + gyro, GYRO_ENABLED) is polled only
 //   while the screen is dimmed, for raise-to-wake: turning the wrist to
 //   look at the watch un-dims the screen without a touch, the same way a
@@ -235,7 +235,7 @@ const uint8_t SCREEN_STAT = 0;       // clock, date, weather line, notification 
 const uint8_t SCREEN_WEATHER = 1;    // full weather
 const uint8_t SCREEN_NOTIF = 2;      // notification list
 const uint8_t SCREEN_MUSIC = 3;      // now-playing, from Gadgetbridge — grouped next to NOTIF
-const uint8_t SCREEN_SETTINGS = 4;   // reached by swiping up on STAT, deliberately not in the nav ring
+const uint8_t SCREEN_SETTINGS = 4;   // reached by swiping down on STAT, deliberately not in the nav ring
 const uint8_t NUM_SCREENS = 5;
 // One of STAT's curved nav buttons — see makeNavBand(). Declared up here,
 // not beside it, because Arduino's generated prototypes would otherwise
@@ -1702,7 +1702,7 @@ bool playMelt(lv_obj_t *next, bool captureOld) {
 // once. The melt is the house style; the slides below are the fallback for
 // when PSRAM couldn't be had, and there direction still carries meaning —
 // sections drop down from the top, the clock slides back up, and settings
-// sits *below* the clock so it rises from the bottom to match its swipe.
+// sits *above* the clock so it drops down from the top to match its swipe.
 void goToScreen(uint8_t idx) {
   if (idx >= NUM_SCREENS) return;
   // Unlike lv_screen_load_anim, playMelt has no "already showing" check of
@@ -1721,8 +1721,8 @@ void goToScreen(uint8_t idx) {
   if (playMelt(screens[idx], true)) return;
 
   lv_scr_load_anim_t anim;
-  if (idx == SCREEN_SETTINGS)      anim = LV_SCR_LOAD_ANIM_MOVE_TOP;    // rises from the bottom
-  else if (from == SCREEN_SETTINGS) anim = LV_SCR_LOAD_ANIM_MOVE_BOTTOM; // drops back down
+  if (idx == SCREEN_SETTINGS)      anim = LV_SCR_LOAD_ANIM_MOVE_BOTTOM; // drops down from the top
+  else if (from == SCREEN_SETTINGS) anim = LV_SCR_LOAD_ANIM_MOVE_TOP;    // slides back up
   else if (idx == SCREEN_STAT)      anim = LV_SCR_LOAD_ANIM_MOVE_TOP;
   else                              anim = LV_SCR_LOAD_ANIM_MOVE_BOTTOM;
   lv_screen_load_anim(screens[idx], anim, 220, 0, false);
@@ -1863,7 +1863,7 @@ void onScreenReleased(lv_event_t *e) {
 
 // Left/right swipe navigation between screens is gone by request —
 // getting around is now entirely via the nav ring on STAT and the back
-// button on every other screen. The only gesture left is swipe-up for
+// button on every other screen. The only gesture left is swipe-down for
 // settings.
 void onScreenGesture(lv_event_t *e) {
   if (pressWasDimWake) return; // a wake-touch must not also act — see esp32-watch-original's identical rule
@@ -1871,9 +1871,9 @@ void onScreenGesture(lv_event_t *e) {
   if (!indev) return;
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
 
-  if (dir == LV_DIR_TOP && currentScreen == SCREEN_STAT) {
-    // The one navigation gesture left: swiping up on the clock face brings
-    // settings up. Kept as a gesture rather than a nav badge so the
+  if (dir == LV_DIR_BOTTOM && currentScreen == SCREEN_STAT) {
+    // The one navigation gesture left: dragging down from the clock face
+    // pulls settings down (by request; it was swipe-up until 2026-10-21). Kept as a gesture rather than a nav badge so the
     // ring's spacing stays as-is.
     goToScreen(SCREEN_SETTINGS);
   }
