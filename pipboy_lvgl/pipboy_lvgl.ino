@@ -237,6 +237,16 @@ const uint8_t SCREEN_NOTIF = 2;      // notification list
 const uint8_t SCREEN_MUSIC = 3;      // now-playing, from Gadgetbridge — grouped next to NOTIF
 const uint8_t SCREEN_SETTINGS = 4;   // reached by swiping up on STAT, deliberately not in the nav ring
 const uint8_t NUM_SCREENS = 5;
+// One of STAT's curved nav buttons — see makeNavBand(). Declared up here,
+// not beside it, because Arduino's generated prototypes would otherwise
+// land above the type.
+struct NavBand {
+  lv_obj_t *fill;   // the inset arc: black, or accent when filled
+  lv_obj_t *icon;   // label or image, recoloured to contrast with fill
+  lv_color_t accent;
+  bool pressed;
+  bool lit;         // stays filled, e.g. the bell while notifications wait
+};
 // TIMER and FLASHLIGHT, then DATA (steps), HISTORY (7-day steps) and the
 // STOPWATCH were removed by request — see git history (or pipboy_watch.ino,
 // which still has them) if any needs reviving.
@@ -1964,8 +1974,6 @@ void onNavButtonClicked(lv_event_t *e) {
   goToScreen(target);
 }
 
-static const int NAV_BTN_PX = 40; // nav badge diameter
-
 // Nav badge icons are real artwork now (see nav_icons.h) rather than
 // shapes drawn from primitives — a hand-built sole/heel/toe shoe
 // silhouette simply didn't read at 26px, and the same would eventually be
@@ -1988,42 +1996,100 @@ void initNavIcons() {
   initNavIconDsc(navSunImgDsc, NAV_ICON_SUN_MAP, NAV_ICON_SUN_W, NAV_ICON_SUN_H);
 }
 
-// Shared shell for every nav badge — the caller adds whatever goes inside
-// (a text label, a symbol glyph, or an image).
-lv_obj_t *makeNavButtonShell(lv_obj_t *parent, lv_color_t accent, uint8_t targetScreen, int dx, int dy) {
-  lv_obj_t *btn = lv_button_create(parent);
-  lv_obj_set_size(btn, NAV_BTN_PX, NAV_BTN_PX);
-  lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(btn, lv_color_black(), 0);
-  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_color(btn, accent, 0);
-  lv_obj_set_style_border_width(btn, 2, 0);
-  lv_obj_set_style_shadow_width(btn, 0, 0);
-  lv_obj_set_style_bg_color(btn, accent, LV_STATE_PRESSED); // visible feedback on press
-  lv_obj_align(btn, LV_ALIGN_CENTER, dx, dy);
-  lv_obj_add_event_cb(btn, onNavButtonClicked, LV_EVENT_CLICKED, (void *)(uintptr_t)targetScreen);
-  return btn;
+// Nav bands: the STAT screen's buttons are curved bands hugging the round
+// panel's edge (2026-10-21, by request) instead of round badges — music on
+// the left, notifications at the top, weather on the right.
+//
+// Each band is two non-clickable lv_arcs sharing a centre line: an accent
+// arc, and a black one inset 2px on every side with the same end angles.
+// Both have rounded caps centred on the same points, so what's left showing
+// is an even 2px accent outline, the same look the round badges had.
+// Filling the inner arc with the accent (and turning the icon black) is the
+// pressed / unread state. Taps land on a transparent button over the band:
+// lv_arc's own press handling would drag its value, and a full-screen arc
+// object would swallow taps meant for everything inside the ring.
+static const int NAV_BAND_OUTER_PX = 234; // diameter, 3px in from the panel edge
+static const int NAV_BAND_WIDTH = 34;     // radial thickness
+static const int NAV_BAND_SPAN_DEG = 60;  // arc length, not counting the rounded caps
+static const int NAV_BAND_MID_R = NAV_BAND_OUTER_PX / 2 - NAV_BAND_WIDTH / 2; // where the icon sits
+
+NavBand navBands[3];
+
+static lv_obj_t *makeBandArc(lv_obj_t *parent, int sizePx, int width, int centreDeg, lv_color_t col) {
+  lv_obj_t *a = lv_arc_create(parent);
+  lv_obj_set_size(a, sizePx, sizePx);
+  lv_obj_center(a);
+  lv_obj_remove_flag(a, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_pad_all(a, 0, LV_PART_MAIN);
+  // LVGL angles: 0 = 3 o'clock, clockwise. An end below the start wraps.
+  lv_arc_set_bg_angles(a, (centreDeg - NAV_BAND_SPAN_DEG / 2 + 360) % 360,
+                       (centreDeg + NAV_BAND_SPAN_DEG / 2) % 360);
+  lv_obj_set_style_arc_width(a, width, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(a, col, LV_PART_MAIN);
+  lv_obj_set_style_arc_rounded(a, true, LV_PART_MAIN);
+  lv_obj_set_style_arc_opa(a, LV_OPA_TRANSP, LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(a, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(a, 0, LV_PART_KNOB);
+  return a;
 }
 
-lv_obj_t *makeNavButton(lv_obj_t *parent, const char *label, lv_color_t accent, uint8_t targetScreen, int dx, int dy) {
-  lv_obj_t *btn = makeNavButtonShell(parent, accent, targetScreen, dx, dy);
-  lv_obj_t *lbl = lv_label_create(btn);
-  lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(lbl, accent, 0);
-  lv_label_set_text(lbl, label);
-  lv_obj_center(lbl);
-  return btn;
+void paintNavBand(NavBand &b) {
+  bool filled = b.pressed || b.lit;
+  lv_obj_set_style_arc_color(b.fill, filled ? b.accent : lv_color_black(), LV_PART_MAIN);
+  lv_color_t fg = filled ? lv_color_black() : b.accent;
+  if (lv_obj_check_type(b.icon, &lv_label_class)) lv_obj_set_style_text_color(b.icon, fg, 0);
+  else lv_obj_set_style_image_recolor(b.icon, fg, 0);
 }
 
-lv_obj_t *makeNavButtonImg(lv_obj_t *parent, const lv_image_dsc_t *img, lv_color_t accent, uint8_t targetScreen, int dx, int dy) {
-  lv_obj_t *btn = makeNavButtonShell(parent, accent, targetScreen, dx, dy);
-  lv_obj_t *icon = lv_image_create(btn);
-  lv_image_set_src(icon, img);
-  // Artwork is stored white; recolor paints it this badge's accent.
-  lv_obj_set_style_image_recolor(icon, accent, 0);
-  lv_obj_set_style_image_recolor_opa(icon, LV_OPA_COVER, 0);
-  lv_obj_center(icon);
-  return btn;
+static void onNavBandPress(lv_event_t *e) {
+  NavBand *b = (NavBand *)lv_event_get_user_data(e);
+  b->pressed = (lv_event_get_code(e) == LV_EVENT_PRESSED);
+  paintNavBand(*b);
+}
+
+// centreDeg in LVGL terms: 180 = left, 270 = top, 0 = right. Pass a symbol
+// for `label`, or nullptr and an `img`.
+NavBand &makeNavBand(lv_obj_t *parent, uint8_t slot, int centreDeg, lv_color_t accent, uint8_t targetScreen,
+                     const char *label, const lv_image_dsc_t *img) {
+  NavBand &b = navBands[slot];
+  b.accent = accent;
+  b.pressed = b.lit = false;
+  makeBandArc(parent, NAV_BAND_OUTER_PX, NAV_BAND_WIDTH, centreDeg, accent);
+  b.fill = makeBandArc(parent, NAV_BAND_OUTER_PX - 4, NAV_BAND_WIDTH - 4, centreDeg, lv_color_black());
+
+  float rad = centreDeg * (float)M_PI / 180.0f;
+  int dx = (int)lroundf(cosf(rad) * NAV_BAND_MID_R);
+  int dy = (int)lroundf(sinf(rad) * NAV_BAND_MID_R);
+  if (label) {
+    b.icon = lv_label_create(parent);
+    lv_obj_set_style_text_font(b.icon, &lv_font_montserrat_14, 0);
+    lv_label_set_text(b.icon, label);
+  } else {
+    b.icon = lv_image_create(parent);
+    lv_image_set_src(b.icon, img);
+    lv_obj_set_style_image_recolor_opa(b.icon, LV_OPA_COVER, 0); // artwork is stored white
+  }
+  lv_obj_align(b.icon, LV_ALIGN_CENTER, dx, dy);
+
+  // Hit box: the band's bounding rectangle, kept clear of the clock, date
+  // and weather row inside the ring. A side band is tall and thin, the top
+  // one wide and short.
+  bool side = (centreDeg == 0 || centreDeg == 180);
+  lv_obj_t *hit = lv_button_create(parent);
+  lv_obj_set_size(hit, side ? 54 : 146, side ? 146 : 54);
+  lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_bg_opa(hit, LV_OPA_TRANSP, LV_STATE_PRESSED);
+  lv_obj_set_style_border_width(hit, 0, 0);
+  lv_obj_set_style_shadow_width(hit, 0, 0);
+  int hitOff = 120 - 27; // centre of a 54px box flush with the panel edge
+  lv_obj_align(hit, LV_ALIGN_CENTER, side ? (dx < 0 ? -hitOff : hitOff) : 0, side ? 0 : -hitOff);
+  lv_obj_add_event_cb(hit, onNavButtonClicked, LV_EVENT_CLICKED, (void *)(uintptr_t)targetScreen);
+  lv_obj_add_event_cb(hit, onNavBandPress, LV_EVENT_PRESSED, &b);
+  lv_obj_add_event_cb(hit, onNavBandPress, LV_EVENT_RELEASED, &b);
+  lv_obj_add_event_cb(hit, onNavBandPress, LV_EVENT_PRESS_LOST, &b);
+
+  paintNavBand(b);
+  return b;
 }
 
 // Back-to-clock button, one per non-STAT screen. With swipe navigation
@@ -2055,7 +2121,7 @@ void addBackNav(lv_obj_t *parent, uint8_t screenIdx, lv_color_t accent) {
 }
 
 lv_obj_t *statTime, *statDate, *statIcon, *statTemp;
-lv_obj_t *navNotifBtn; // kept so it can show an unread-notification state — see updateStatScreen()
+NavBand *navNotifBand = nullptr; // kept so it can show an unread-notification state — see updateStatScreen()
 
 void buildStatScreen() {
   lv_obj_t *s = screens[SCREEN_STAT] = lv_obj_create(NULL);
@@ -2063,17 +2129,14 @@ void buildStatScreen() {
   lv_color_t accent = lv_color_hex(0x55FF6E); // COL_GREEN
 
   initNavIcons();
-  // Nav ring: three badges since steps, history and the stopwatch went
-  // (2026-10-21), centred on the top at -40°/0°/+40° on r=92. 40px badges
-  // need >=42px between centres; the 40° (~63px) pitch is the one the old
-  // six-badge ring was confirmed with. Offsets are r·sin(θ) / −r·cos(θ).
-  // Needs a look on the real panel.
-  makeNavButton(s, LV_SYMBOL_AUDIO, lv_color_hex(0xAF6EFF), SCREEN_MUSIC, -59, -70);    // COL_PURPLE, -40°
-  navNotifBtn = makeNavButton(s, LV_SYMBOL_BELL, lv_color_hex(0x5AAFFF), SCREEN_NOTIF, 0, -92); // COL_BLUE, 0°
-  makeNavButtonImg(s, &navSunImgDsc, lv_color_hex(0xFFDC46), SCREEN_WEATHER, 59, -70);  // COL_YELLOW, +40°
+  // Nav bands around the edge — see makeNavBand(). Each spans 60° (plus its
+  // rounded caps), leaving the bottom free for the status cluster.
+  makeNavBand(s, 0, 180, lv_color_hex(0xAF6EFF), SCREEN_MUSIC, LV_SYMBOL_AUDIO, nullptr);   // COL_PURPLE, left
+  navNotifBand = &makeNavBand(s, 1, 270, lv_color_hex(0x5AAFFF), SCREEN_NOTIF, LV_SYMBOL_BELL, nullptr); // COL_BLUE, top
+  makeNavBand(s, 2, 0, lv_color_hex(0xFFDC46), SCREEN_WEATHER, nullptr, &navSunImgDsc);     // COL_YELLOW, right
 
   // The notification banner that used to sit at the top of this screen is
-  // gone — the nav ring now occupies that band, and it was the only row
+  // gone — the nav bands now occupy that space, and it was the only row
   // with space for it. Nothing is actually lost: a new notification still
   // pops the NOTIF screen up on arrival (see handleGadgetbridgeLine()), the
   // full list is a tap away on the bell, and the bell itself now fills in
@@ -2082,7 +2145,7 @@ void buildStatScreen() {
   lv_obj_set_style_text_font(statTime, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(statTime, accent, 0); // green, matching the rest of the phosphor theme
   lv_label_set_text(statTime, "--:--");
-  lv_obj_align(statTime, LV_ALIGN_CENTER, 0, -18); // +8: at 10:00 the leading "1" was catching the music badge at dx=-80,dy=-46
+  lv_obj_align(statTime, LV_ALIGN_CENTER, 0, -18); // +8: at 10:00 the leading "1" was catching the old music badge at dx=-80,dy=-46
 
   // Date/icon/temp row spacing below is deliberately generous — the
   // original values (date at dy=24, icon at dy=56) put the 64px icon's
@@ -2111,10 +2174,11 @@ void buildStatScreen() {
 }
 
 void updateStatScreen(struct tm &t, int battPct) {
-  // Bell badge fills in when anything is waiting — this is what replaced
+  // Bell band fills in when anything is waiting — this is what replaced
   // the old text banner across the top of this screen.
-  if (navNotifBtn) {
-    lv_obj_set_style_bg_color(navNotifBtn, notifCount ? lv_color_hex(0x5AAFFF) : lv_color_black(), 0);
+  if (navNotifBand && navNotifBand->lit != (notifCount > 0)) {
+    navNotifBand->lit = notifCount > 0;
+    paintNavBand(*navNotifBand);
   }
 
   char timebuf[16];
