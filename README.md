@@ -94,6 +94,14 @@ power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
   sleep). Needs `esp_sleep_enable_ext1_wakeup()` with `ESP_EXT1_WAKEUP_ANY_LOW`
   once the button exists — see the TODO comment above
   `powerDownAndDeepSleep()`.
+- **Charge-status wire** (user plans to do it at some point): the charger's
+  status signal (ETA6098 STAT/CHRG, usually the one driving the charge LED)
+  isn't on a GPIO, so the firmware can't tell charging from discharging.
+  Wire it to a spare rear-header GPIO (15/16/17/18/21, a different one from
+  the power button's). Check the pad, polarity (likely open-drain, low
+  while charging: ) and its "full" behaviour on the real board
+  first. Firmware then: a charging icon in the status cluster, and learn
+  the 100% point only once charging has finished.
 - **Battery charging ceiling**: the displayed percentage has been observed
   capping in the high 80s while charging. Two live hypotheses, not yet
   distinguished: (a) normal voltage-under-charging-current effect (would
