@@ -99,7 +99,7 @@ power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
   isn't on a GPIO, so the firmware can't tell charging from discharging.
   Wire it to a spare rear-header GPIO (15/16/17/18/21, a different one from
   the power button's). Check the pad, polarity (likely open-drain, low
-  while charging: ) and its "full" behaviour on the real board
+  while charging: `INPUT_PULLUP`) and its "full" behaviour on the real board
   first. Firmware then: a charging icon in the status cluster, and learn
   the 100% point only once charging has finished.
 - **Battery charging ceiling**: the displayed percentage has been observed
