@@ -102,6 +102,13 @@ power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
   200k/100k divider and a perfectly-calibrated ADC with no correction for
   either. Needs an independent multimeter reading compared against the
   Serial-logged `battery: XXXXmV` value to tell which.
+  **`pipboy_lvgl` works around it (2026-10-21):** its gauge filters the
+  reading (5s samples, ~40s low-pass that survives deep sleep), moves the
+  shown % only for ≥2% changes at 1% per 15s, and scales the curve so the
+  highest filtered reading ever seen counts as 100% (NVS `battMax`,
+  clamped 4050-4200mV). A charge 2026-10-21 on laptop USB read 3924 →
+  3999mV over ~7 min, so the charger does charge. There is still no
+  charging indicator: the charger's status pin isn't on a GPIO.
 - R15 charge-current resistor swap (160K → ~330K, so the charger targets
   ~500mA into a cell rated for that instead of ~1A) has been done by the
   user on the physical board. Not independently verified by inspection —
@@ -202,19 +209,20 @@ bug, an LVGL/LovyanGFX RGB565 byte-order mismatch, a touch-coordinate
 Y-inversion that made every button unclickable, and the verified
 Gadgetbridge music protocol).
 
-**Seven screens**: STAT (clock), DATA (steps), HISTORY (7-day chart),
-WEATHER, NOTIF, MUSIC, STOPWATCH. TIMER and FLASHLIGHT were removed by
-request — `pipboy_watch/` still has both if either needs reviving.
+**Five screens**: STAT (clock), WEATHER, NOTIF, MUSIC and SETTINGS. TIMER
+and FLASHLIGHT were removed by request, and on 2026-10-21 so were DATA
+(steps), HISTORY (7-day steps) and STOPWATCH, along with the pedometer, the
+BLE steps characteristic and the step reports to Gadgetbridge.
+`pipboy_watch/` still has all of them if any needs reviving.
 
 **Navigation is entirely button-driven** — swipe-to-cycle is gone. STAT
-carries a ring of six round nav badges on a ±100° arc across the top
-(spacing derived from the geometry: 40px badges need ≥42px between
-centres, so a 200° span at r=92 puts them ~63px apart), and every other
+carries a ring of three round nav badges (music, notifications, weather) at
+-40°/0°/+40° across the top, r=92 (40px badges need ≥42px between centres;
+40° puts them ~63px apart, the pitch the old six-badge ring was confirmed
+with), and every other
 screen has an identical back button at bottom centre. Swiping up on the
 clock face opens SETTINGS, which is deliberately not in the nav ring.
-Screens change with the **melt transition** described below. The only other
-surviving gesture is the stopwatch's swipe-to-clear, which was never
-screen-to-screen navigation.
+Screens change with the **melt transition** described below.
 
 **Screen melt transition** (`playMelt()`): LVGL ships eight slide variants
 and a fade, with no hook for anything per-column, so this is hand-rolled —
@@ -251,8 +259,8 @@ the snapshot taken before Vault Boy's 73KB sprite is freed, which is why
 `initMelt()` runs up with the LVGL display setup rather than beside the
 other screen builders.
 
-**Per-section colours**: clock/steps green, history orange, weather
-yellow, notifications blue, music purple, stopwatch red. Each section's
+**Per-section colours**: clock green, weather yellow, notifications blue,
+music purple. Each section's
 accent carries through its whole screen, its nav badge, and its back
 button. The weather badge draws an actual sun (via the icon sprite
 bridge below) rather than a text label.
@@ -269,8 +277,9 @@ WiFi-portal and sleep screens.
 **Reused wholesale, unchanged**, from `pipboy_watch.ino`: WiFi/NTP sync and
 the WiFiManager captive portal, BLE setup and the entire Gadgetbridge
 message parser (notify/weather/musicinfo/musicstate/setTime), the battery
-curve and critical-battery shutdown, NVS persistence, the step-history
-rollover, raise-to-wake's IMU math, and deep sleep. The WiFi-setup-portal
+curve and critical-battery shutdown, NVS persistence, raise-to-wake's IMU
+math, and deep sleep. (Since reworked here: Gadgetbridge lines are parsed on
+the loop task rather than the BLE task, and the battery gauge — see below.) The WiFi-setup-portal
 and sleep/critical-battery screens still draw straight to `display` as
 plain LovyanGFX calls; that stays conflict-free with LVGL because
 `lv_timer_handler()` is never pumped during those windows, and LVGL only
@@ -282,12 +291,11 @@ just parameterized to draw onto an off-screen `LGFX_Sprite` instead of the
 global `display`, which then gets handed to LVGL as a plain image (once the
 RGB565 byte-order mismatch between the two libraries was found and fixed —
 see project memory). The gesture *decision logic* (tap-duration thresholds,
-the 4-tap step reset, which duration means sleep vs. WiFi-portal) is also
+which duration means sleep vs. WiFi-portal) is also
 reused essentially verbatim, just triggered from LVGL's press/release/
 gesture events instead of a hand-rolled polling loop.
 
-**New**: the whole screen layer, built as LVGL widgets — labels, an
-`lv_bar`-based history chart, a scrollable snap-list for notifications
+**New**: the whole screen layer, built as LVGL widgets — labels, a scrollable snap-list for notifications
 (replacing pipboy_watch's index-paged list), LVGL's built-in symbol glyphs
 (`LV_SYMBOL_BATTERY_*`, `LV_SYMBOL_BLUETOOTH`, `LV_SYMBOL_PLAY`/`PAUSE`) in
 place of the hand-drawn battery/Bluetooth icons, and a tiled,

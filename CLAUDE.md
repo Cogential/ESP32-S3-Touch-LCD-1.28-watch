@@ -65,5 +65,18 @@ There are no tests or linters: verification means compiling, then flashing and c
 - Review items still open (see /data/cogent/reviews/2026-10-20/review-smartwatch.md): #5 pipboy_watch music
   command format, #6 slide fallback is a no-op when the new snapshot fails (restore the previous screen first,
   but only when `captureOld`, because the boot screen is already deleted), #7 scanlines missing during the melt,
-  #8 step history shifts one slot no matter how many days passed, #9 extra final melt frame, #10 melt memory/
-  `waitDMA` cleanup.
+  #9 extra final melt frame, #10 melt memory/`waitDMA` cleanup. (#8, the step-history rollover, went away with
+  the steps screens.)
+
+## pipboy_lvgl changes on 2026-10-21
+
+- **Steps, 7-day history and the stopwatch were removed by request** (screens, pedometer, BLE steps
+  characteristic, Gadgetbridge `act` reports, NVS step keys, which `loadState()` deletes). Don't bring them
+  back unasked. Screens are now STAT, WEATHER, NOTIF, MUSIC, SETTINGS; the nav ring is three badges at
+  -40°/0°/+40°. The IMU is only polled while dimmed (raise-to-wake is its only user).
+- **Battery gauge** (`// ---------- battery gauge ----------`): filtered and rate-limited, with the full point
+  learned from the highest filtered reading (NVS `battMax`, clamped 4050-4200mV) because this board reads a
+  full cell low. The critical-battery check in `setup()` deliberately still uses the raw reading. The serial
+  log line `battery: raw .. filt .. full .. -> X% (showing Y%)` is what to capture if the gauge misbehaves.
+  There's no charge detection; the only real fix for that is wiring the charger's status signal to a spare
+  GPIO (15/16/17/18/21).
