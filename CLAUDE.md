@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 Arduino (ESP32-S3) firmware for a Waveshare **ESP32-S3-Touch-LCD-1.28** (round 240x240 GC9A01, CST816S touch,
-QMI8658 IMU, no RTC, no power button) styled as a Fallout Pip-Boy. Repo: github.com/Cogential/pipboy-watch.
+QMI8658 IMU, no RTC, no power button) styled as a Fallout Pip-Boy. Repo: github.com/Cogential/ESP32-S3-Touch-LCD-1.28-watch (renamed from pipboy-watch on 2026-10-21; remote `origin`).
 `README.md` is the detailed design writeup (features, power/battery behaviour, open questions); read the section
 for a sketch before changing it. Project memory holds the hardware-confirmed gotchas for `pipboy_lvgl/`.
 
@@ -17,7 +17,7 @@ so a fix in one copy does not reach the others.
   change it unless asked. It still has TIMER, FLASHLIGHT and swipe navigation.
 - `pipboy_lvgl/`: the active firmware. Same back end (WiFi/NTP + WiFiManager portal, BLE Gadgetbridge parser, battery
   curve, NVS, steps, raise-to-wake, deep sleep) reused nearly verbatim from `pipboy_watch.ino`, with a new LVGL v9.5
-  screen layer. It has diverged on purpose (button nav ring, SETTINGS screen, no timer/flashlight), so don't assume
+  screen layer. It has diverged on purpose (curved nav bands on STAT, SETTINGS screen, no timer/flashlight), so don't assume
   the two match.
 - `lvgl_watch/`: minimal LVGL proof of concept (arc + counting label, no real time). Reference only.
 
@@ -72,8 +72,8 @@ There are no tests or linters: verification means compiling, then flashing and c
 
 - **Steps, 7-day history and the stopwatch were removed by request** (screens, pedometer, BLE steps
   characteristic, Gadgetbridge `act` reports, NVS step keys, which `loadState()` deletes). Don't bring them
-  back unasked. Screens are now STAT, WEATHER, NOTIF, MUSIC, SETTINGS; the nav ring is three badges at
-  -40°/0°/+40°. The IMU is only polled while dimmed (raise-to-wake is its only user).
+  back unasked. Screens are now STAT, WEATHER, NOTIF, MUSIC, SETTINGS; STAT's nav is three curved bands
+  around the edge (`makeNavBand()`: music left, notifications top, weather right). The IMU is only polled while dimmed (raise-to-wake is its only user).
 - **Battery gauge** (`// ---------- battery gauge ----------`): filtered and rate-limited, with the full point
   learned from the highest filtered reading (NVS `battMax`, clamped 4050-4200mV) because this board reads a
   full cell low. The critical-battery check in `setup()` deliberately still uses the raw reading. The serial

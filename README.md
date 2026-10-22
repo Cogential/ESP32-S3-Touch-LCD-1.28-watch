@@ -1,8 +1,58 @@
-# smartwatch
+# ESP32-S3-Touch-LCD-1.28-watch
 
 Firmware for a Waveshare **ESP32-S3-Touch-LCD-1.28** (round 240×240 GC9A01
 panel, CST816S capacitive touch, QMI8658 accel+gyro, no RTC, no physical
 power button) turned into a Fallout Pip-Boy 3000-style wrist watch.
+
+## Phone setup: Gadgetbridge
+
+The watch has no phone app of its own. It pretends to be a Bangle.js so the
+free, open-source [Gadgetbridge](https://gadgetbridge.org/) Android app
+drives it: time, notifications, weather and music.
+
+1. **Install Gadgetbridge** on the phone, from F-Droid or Google Play.
+2. **Flash and power on the watch.** It advertises over Bluetooth as
+   **"Bangle.js Pip-Boy 3000"**. Keep that name if you change the firmware:
+   Gadgetbridge picks the device type from the name, and anything not
+   starting "Bangle.js" won't be offered as one.
+3. **Pair it in Gadgetbridge:** tap **+** (add device), let it scan, and pick
+   "Bangle.js Pip-Boy 3000". Pairing is "Just Works", so there's no PIN to
+   type. Once connected, Gadgetbridge sets the watch's clock automatically on
+   every connect, which keeps the time right when Wi-Fi isn't around.
+4. **Give Gadgetbridge notification access** (Android Settings, then
+   Notifications, then Device & app notifications, then Gadgetbridge). This
+   is what forwards notifications, and it's also what lets Gadgetbridge read
+   the track and artist from Spotify or any other player. Without it the
+   MUSIC screen gets play/pause state but no track name.
+   - **If the toggle is greyed out or won't stay on** (Android 13+ with
+     Gadgetbridge installed from F-Droid): Settings, then Apps, then
+     Gadgetbridge, then the **⋮** menu, then **Allow restricted settings**.
+     Then grant notification access again.
+5. **Weather** needs a separate weather app, because Gadgetbridge has no
+   weather source of its own: it only passes on what a weather app sends
+   it. See "Weather app" below.
+
+What you get on the watch:
+- **Notifications** pop up for 8 seconds and stay in the bell's list until
+  you dismiss them on the phone (the watch removes them too).
+- **Music**: track, artist and a progress ring, with previous / play-pause /
+  next buttons that control the phone.
+- **Find phone**: SETTINGS (swipe up on the clock face), then "Find phone",
+  rings the phone. Tap again to stop.
+- **Wi-Fi time sync** is separate from Gadgetbridge: on first boot, or when
+  no saved network is in range, the watch opens a "PipBoy-Setup" Wi-Fi
+  hotspot to choose a network. To open it again on demand, hold a finger
+  still on the screen for 6-12 seconds (3-6 seconds puts the watch to sleep).
+
+### Weather app
+
+TODO: which weather app, and how its Gadgetbridge option is set up.
+
+## Hardware
+
+- **Board:** Waveshare ESP32-S3-Touch-LCD-1.28 (see top of this file).
+- **Battery:** TODO.
+- **Case:** TODO, the 3D model used to hold the board and battery.
 
 ## Projects in this repo
 
@@ -224,12 +274,12 @@ BLE steps characteristic and the step reports to Gadgetbridge.
 `pipboy_watch/` still has all of them if any needs reviving.
 
 **Navigation is entirely button-driven** — swipe-to-cycle is gone. STAT
-carries a ring of three round nav badges (music, notifications, weather) at
--40°/0°/+40° across the top, r=92 (40px badges need ≥42px between centres;
-40° puts them ~63px apart, the pitch the old six-badge ring was confirmed
-with), and every other
+carries three curved nav bands hugging the panel edge (2026-10-21): music on
+the left, notifications at the top, weather on the right, each a 60° outlined
+arc (`makeNavBand()`) that fills in when pressed (the bell's also fills while
+notifications wait). Every other
 screen has an identical back button at bottom centre. Swiping up on the
-clock face opens SETTINGS, which is deliberately not in the nav ring.
+clock face opens SETTINGS, which deliberately has no nav band.
 Screens change with the **melt transition** described below.
 
 **Screen melt transition** (`playMelt()`): LVGL ships eight slide variants
@@ -269,8 +319,8 @@ other screen builders.
 
 **Per-section colours**: clock green, weather yellow, notifications blue,
 music purple. Each section's
-accent carries through its whole screen, its nav badge, and its back
-button. The weather badge draws an actual sun (via the icon sprite
+accent carries through its whole screen, its nav band, and its back
+button. The weather band draws an actual sun (via the icon sprite
 bridge below) rather than a text label.
 
 **Boot** is its own LVGL screen now, not the old scrolling terminal log: a
@@ -319,8 +369,8 @@ buttons with their own hit targets and press states, and marquee-scrolling
 long titles into a block.
 
 The **notification banner** that used to sit atop the clock screen is gone
-— the nav ring occupies that band now. New notifications still pop the
-NOTIF screen up on arrival, and the bell badge fills in while anything is
+— the nav bands occupy that space now. New notifications still pop the
+NOTIF screen up on arrival, and the bell band fills in while anything is
 waiting.
 
 **Outstanding, not a firmware issue**: track/artist names on the MUSIC
